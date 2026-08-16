@@ -212,14 +212,30 @@ class ExecutionRepository:
         return items, total or 0
 
     async def list_audit_events(
-        self, context: TenantContext, *, limit: int, offset: int
+        self,
+        context: TenantContext,
+        *,
+        event_type: str | None = None,
+        resource_type: str | None = None,
+        resource_id: UUID | None = None,
+        actor_id: UUID | None = None,
+        limit: int,
+        offset: int,
     ) -> tuple[list[AuditEvent], int]:
-        predicate = AuditEvent.tenant_id == context.tenant_id
+        predicate = [AuditEvent.tenant_id == context.tenant_id]
+        if event_type is not None:
+            predicate.append(AuditEvent.event_type == event_type)
+        if resource_type is not None:
+            predicate.append(AuditEvent.resource_type == resource_type)
+        if resource_id is not None:
+            predicate.append(AuditEvent.resource_id == resource_id)
+        if actor_id is not None:
+            predicate.append(AuditEvent.actor_id == actor_id)
         events = list(
             (
                 await self.session.scalars(
                     select(AuditEvent)
-                    .where(predicate)
+                    .where(*predicate)
                     .order_by(AuditEvent.created_at, AuditEvent.id)
                     .limit(limit)
                     .offset(offset)
@@ -227,7 +243,7 @@ class ExecutionRepository:
             ).all()
         )
         total = await self.session.scalar(
-            select(func.count()).select_from(AuditEvent).where(predicate)
+            select(func.count()).select_from(AuditEvent).where(*predicate)
         )
         return events, total or 0
 

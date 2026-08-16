@@ -791,6 +791,228 @@ async def test_rejection_and_audit_history_are_paginated(client: AsyncClient) ->
     assert all(item["tenant_id"] == tenant["id"] for item in body["items"])
 
 
+async def test_audit_event_filters_work_independently_and_compose_with_and(
+    client: AsyncClient,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Scoped Audit Filters")
+    first_job = await create_job(client, tenant, workspace, key="first-filter-job")
+    second_job = await create_job(client, tenant, workspace, key="second-filter-job")
+    actor_id = str(uuid4())
+    transitioned = await transition_job(
+        client,
+        tenant,
+        first_job,
+        ExecutionStatus.QUEUED,
+        ExecutionStatus.RUNNING,
+        actor_id=actor_id,
+    )
+    assert transitioned.status_code == 200
+
+    base_url = f"/api/v1/tenants/{tenant['id']}/audit-events"
+    by_event = await client.get(
+        f"{base_url}?event_type=execution_job.transitioned", headers=headers(tenant)
+    )
+    by_resource_type = await client.get(
+        f"{base_url}?resource_type=execution_job", headers=headers(tenant)
+    )
+    by_resource_id = await client.get(
+        f"{base_url}?resource_id={second_job['id']}", headers=headers(tenant)
+    )
+    by_actor = await client.get(f"{base_url}?actor_id={actor_id}", headers=headers(tenant))
+    composed = await client.get(
+        f"{base_url}?event_type=execution_job.transitioned"
+        f"&resource_type=execution_job&resource_id={first_job['id']}&actor_id={actor_id}",
+        headers=headers(tenant),
+    )
+
+    assert [item["resource_id"] for item in by_event.json()["items"]] == [first_job["id"]]
+    assert by_event.json()["pagination"]["total"] == 1
+    assert by_resource_type.json()["pagination"]["total"] == 3
+    assert [item["resource_id"] for item in by_resource_id.json()["items"]] == [second_job["id"]]
+    assert by_resource_id.json()["pagination"]["total"] == 1
+    assert [item["actor_id"] for item in by_actor.json()["items"]] == [actor_id]
+    assert by_actor.json()["pagination"]["total"] == 1
+    assert [item["event_type"] for item in composed.json()["items"]] == [
+        "execution_job.transitioned"
+    ]
+    assert composed.json()["pagination"]["total"] == 1
+
+
+async def test_filtered_audit_events_have_stable_pages_full_totals_and_empty_results(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Paged Audit Filters")
+    first_job = await create_job(client, tenant, workspace, key="first-paged-job")
+    second_job = await create_job(client, tenant, workspace, key="second-paged-job")
+    tied_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    async with session_factory() as session:
+        await session.execute(
+            update(AuditEvent)
+            .where(
+                AuditEvent.resource_id.in_(
+                    [UUID(str(first_job["id"])), UUID(str(second_job["id"]))]
+                )
+            )
+            .values(created_at=tied_created_at)
+        )
+        await session.commit()
+
+    base_url = (
+        f"/api/v1/tenants/{tenant['id']}/audit-events?event_type=execution_job.created&limit=1"
+    )
+    first_page = await client.get(f"{base_url}&offset=0", headers=headers(tenant))
+    second_page = await client.get(f"{base_url}&offset=1", headers=headers(tenant))
+    empty_page = await client.get(f"{base_url}&offset=2", headers=headers(tenant))
+    unknown = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?event_type=unknown.event",
+        headers=headers(tenant),
+    )
+
+    ordered_ids = sorted(
+        [item["id"] for item in first_page.json()["items"] + second_page.json()["items"]]
+    )
+    assert [item["id"] for item in first_page.json()["items"]] == ordered_ids[:1]
+    assert [item["id"] for item in second_page.json()["items"]] == ordered_ids[1:]
+    assert first_page.json()["pagination"]["total"] == 2
+    assert empty_page.json() == {
+        "items": [],
+        "pagination": {"limit": 1, "offset": 2, "total": 2},
+    }
+    assert unknown.json() == {
+        "items": [],
+        "pagination": {"limit": 50, "offset": 0, "total": 0},
+    }
+
+
+async def test_audit_filters_preserve_tenant_isolation_when_identifiers_collide(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_a, workspace_a = await setup_tenant(client, "Audit Tenant A")
+    tenant_b, _workspace_b = await setup_tenant(client, "Audit Tenant B")
+    job = await create_job(client, tenant_a, workspace_a, key="colliding-audit-job")
+    actor_id = uuid4()
+    collision_resource_id = UUID(str(job["id"]))
+    async with session_factory() as session:
+        session.add(
+            AuditEvent(
+                id=uuid4(),
+                tenant_id=UUID(str(tenant_b["id"])),
+                event_type="execution_job.created",
+                resource_type="execution_job",
+                resource_id=collision_resource_id,
+                actor_id=actor_id,
+                details={},
+            )
+        )
+        await session.commit()
+
+    by_resource = await client.get(
+        f"/api/v1/tenants/{tenant_a['id']}/audit-events?resource_id={collision_resource_id}",
+        headers=headers(tenant_a),
+    )
+    by_actor = await client.get(
+        f"/api/v1/tenants/{tenant_a['id']}/audit-events?actor_id={actor_id}",
+        headers=headers(tenant_a),
+    )
+
+    assert by_resource.json()["pagination"]["total"] == 1
+    assert {item["tenant_id"] for item in by_resource.json()["items"]} == {tenant_a["id"]}
+    assert by_actor.json()["items"] == []
+    assert by_actor.json()["pagination"]["total"] == 0
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "event_type=",
+        "event_type=Execution.Job",
+        "event_type=execution-job.created",
+        "event_type=execution..created",
+        f"event_type={'a' * 101}",
+        "resource_type=",
+        "resource_type=ExecutionJob",
+        "resource_type=execution-job",
+        "resource_type=execution.job",
+        f"resource_type={'a' * 101}",
+        "resource_id=not-a-uuid",
+        "actor_id=not-a-uuid",
+        "limit=0",
+        "limit=101",
+        "offset=-1",
+    ],
+)
+async def test_audit_filters_retain_structured_validation_errors(
+    client: AsyncClient, query: str
+) -> None:
+    tenant, _workspace = await setup_tenant(client, f"Invalid audit filter {query}")
+
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?{query}", headers=headers(tenant)
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_filtered_audit_repository_is_tenant_safe_deterministic_and_read_only(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Audit Repository Filter")
+    job = await create_job(client, tenant, workspace, key="repository-audit-job")
+    actor_id = str(uuid4())
+    assert (
+        await transition_job(
+            client,
+            tenant,
+            job,
+            ExecutionStatus.QUEUED,
+            ExecutionStatus.RUNNING,
+            actor_id=actor_id,
+        )
+    ).status_code == 200
+
+    async with session_factory() as session:
+        repository = ExecutionRepository(session)
+        before = await session.scalar(select(func.count()).select_from(AuditEvent))
+        events, total = await repository.list_audit_events(
+            TenantContext(tenant_id=UUID(str(tenant["id"]))),
+            event_type="execution_job.transitioned",
+            resource_type="execution_job",
+            resource_id=UUID(str(job["id"])),
+            actor_id=UUID(actor_id),
+            limit=1,
+            offset=0,
+        )
+        after = await session.scalar(select(func.count()).select_from(AuditEvent))
+
+    assert total == 1
+    assert [event.event_type for event in events] == ["execution_job.transitioned"]
+    assert after == before
+
+
+async def test_filtered_audit_endpoint_has_no_write_or_audit_side_effect(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Read Only Audit Filter")
+    job = await create_job(client, tenant, workspace, key="read-only-audit-job")
+    async with session_factory() as session:
+        before = await session.scalar(select(func.count()).select_from(AuditEvent))
+
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?resource_id={job['id']}",
+        headers=headers(tenant),
+    )
+
+    async with session_factory() as session:
+        after = await session.scalar(select(func.count()).select_from(AuditEvent))
+    assert response.status_code == 200
+    assert after == before
+
+
 @pytest.mark.parametrize(
     ("expected_status", "target_status"),
     [(expected, target) for expected, targets in ALLOWED_TRANSITIONS.items() for target in targets],

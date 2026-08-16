@@ -61,6 +61,16 @@ tie-breaker, and calculates a job-specific total independent of `limit` and `off
 beyond the final attempt return an empty page with the unchanged total. The endpoint is strictly
 read-only and creates no audit event.
 
+`GET /api/v1/tenants/{tenant_id}/audit-events` accepts optional `event_type`, `resource_type`,
+`resource_id`, and `actor_id` filters. Event types use the stored 1–100 character lowercase dotted
+and underscored convention, and resource types use the stored 1–100 character lowercase
+underscored convention. Resource and actor identifiers are parsed as UUIDs without resolving the
+referenced entity. Every query retains the tenant predicate, and supplied filters compose with
+logical AND. The same predicate is applied to the `(created_at, id)` ordered page and its
+independent full total. Unfiltered requests preserve the existing bounded `limit`/`offset`
+response, while well-formed filters with no matches return a valid empty page. Listing is strictly
+read-only and creates no audit event.
+
 `POST /api/v1/tenants/{tenant_id}/execution-jobs/{job_id}/transitions` accepts a strict body:
 
 ```json
@@ -119,9 +129,10 @@ unchanged.
 
 ## Rollback
 
-FOUNDATION-008 through FOUNDATION-011 have no migrations. Revert their respective implementation
-commits to remove the transition, retry, run-history endpoint, or job-list filters. Existing job,
-run, and audit rows remain valid; successful transitions and retry reservations already committed
-are historical state and are not reversed by the code rollback. Removing read-only history or
-filtering has no data effect. The earlier additive migration rollback remains available, but
-dropping those tables would delete control-plane history and requires a backup first.
+FOUNDATION-008 through FOUNDATION-012 have no migrations. Revert their respective implementation
+commits to remove the transition, retry, run-history endpoint, job-list filters, or audit-list
+filters. Existing job, run, and audit rows remain valid; successful transitions and retry
+reservations already committed are historical state and are not reversed by the code rollback.
+Removing read-only history or filtering has no data effect. The earlier additive migration
+rollback remains available, but dropping those tables would delete control-plane history and
+requires a backup first.
