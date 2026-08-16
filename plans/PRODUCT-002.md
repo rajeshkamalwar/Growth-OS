@@ -8,6 +8,10 @@ authorizes this specification and the corresponding current-task update; it does
 runtime implementation. If implementation requires a design change, update and review this
 specification before changing runtime code.
 
+PLANNING-003 corrects superseded resource names and the `success_definition` bound in this
+specification. Issue #36 remains authoritative, and no runtime implementation occurred under the
+superseded names.
+
 ## Objective
 
 Add one durable primary goal per workspace. A client can create, retrieve, and partially update a
@@ -52,9 +56,10 @@ make migrate
 make dev
 
 # Focused and full tests
-.venv/bin/pytest tests/api/test_workspace_goals.py tests/db/test_workspace_goal_constraints.py
+.venv/bin/pytest tests/api/test_workspace_primary_growth_goals.py \
+  tests/db/test_workspace_primary_growth_goal_constraints.py
 GROWTH_OS_TEST_DATABASE_URL='postgresql+asyncpg://<user>:<password>@<host>/<disposable-db>' \
-  .venv/bin/pytest tests/db/test_workspace_goal_constraints.py -k postgresql
+  .venv/bin/pytest tests/db/test_workspace_primary_growth_goal_constraints.py -k postgresql
 .venv/bin/pytest
 
 # Lint, formatting verification, and strict typing
@@ -87,18 +92,20 @@ approval, a verified backup, and a tested recovery plan. The new migration must 
 ## Affected Project Structure
 
 ```text
-docs/CURRENT-TASK.md                         active PRODUCT-002 authorization
+docs/CURRENT-TASK.md                         PLANNING-003 specification-correction authorization
 plans/PRODUCT-002.md                         this reviewed implementation specification
-README.md                                    goal endpoint and rollback guidance
-migrations/versions/<revision>_workspace_goals.py
-                                               additive goal-table migration
-src/growth_os/db/models.py                   WorkspaceGoal model
+README.md                                    primary-growth-goal endpoint and rollback guidance
+migrations/versions/<revision>_workspace_primary_growth_goals.py
+                                               additive primary-growth-goal-table migration
+src/growth_os/db/models.py                   WorkspacePrimaryGrowthGoal model
 src/growth_os/api/schemas.py                 strict create/patch/response schemas
-src/growth_os/repositories.py                tenant/workspace-scoped goal query
+src/growth_os/repositories.py                tenant/workspace-scoped primary-growth-goal query
 src/growth_os/services.py                    lifecycle and atomic audit transaction
 src/growth_os/api/foundation.py              tenant-scoped POST/GET/PATCH routes
-tests/api/test_workspace_goals.py            API, validation, isolation, and audit behavior
-tests/db/test_workspace_goal_constraints.py  database constraints and rollback behavior
+tests/api/test_workspace_primary_growth_goals.py
+                                               API, validation, isolation, and audit behavior
+tests/db/test_workspace_primary_growth_goal_constraints.py
+                                               database constraints and rollback behavior
 ```
 
 Existing explicit modules and patterns are sufficient. Do not add a generic CRUD framework, a
@@ -107,19 +114,20 @@ nearby suites if all named behavior remains clear and deterministic.
 
 ## Data Contract
 
-Create an additive `workspace_goals` table containing:
+Create an additive `workspace_primary_growth_goals` table containing:
 
 - mixin-provided UUID `id`, timezone-aware `created_at`, and timezone-aware `updated_at`;
 - required UUID `tenant_id` and `workspace_id`;
 - required `objective` as `String(2000)`;
-- nullable `success_definition` as `String(4000)`;
+- nullable `success_definition` as `String(2000)`;
 - nullable `target_date` as SQL `Date`.
 
 Use a composite foreign key from `(workspace_id, tenant_id)` to the same columns on `workspaces`,
 with `ON DELETE RESTRICT`, and a unique constraint on `(tenant_id, workspace_id)`. These enforce
 same-tenant ownership and at most one primary goal per workspace. The unique constraint may serve
 the combined lookup; add no redundant index. The migration creates only the table, its constraints,
-and any demonstrably necessary indexes. Its downgrade drops only `workspace_goals`.
+and any demonstrably necessary indexes. Its downgrade drops only
+`workspace_primary_growth_goals`.
 
 `target_date` is a calendar date serialized as ISO `YYYY-MM-DD`, not a timestamp. Past, present,
 and future dates are valid: the persistence API records supplied intent and must not silently
@@ -128,9 +136,9 @@ reinterpret or reject an existing business target based on the server clock.
 ## API Contract
 
 ```text
-POST  /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/goal
-GET   /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/goal
-PATCH /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/goal
+POST  /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/primary-growth-goal
+GET   /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/primary-growth-goal
+PATCH /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/primary-growth-goal
 ```
 
 All methods require the existing `X-Tenant-ID` context to match the path tenant. All operations
@@ -142,7 +150,7 @@ cross-tenant existence. Duplicate and concurrent creation return the established
 Create accepts:
 
 - required `objective`, stripped, non-blank, maximum 2,000 characters;
-- optional `success_definition`, stripped, non-blank when non-null, maximum 4,000 characters;
+- optional `success_definition`, stripped, non-blank when non-null, maximum 2,000 characters;
 - optional `target_date` as a strict ISO date;
 - optional UUID `actor_id`, used only for audit attribution.
 
@@ -167,12 +175,12 @@ The repository provides one tenant-scoped lookup by `(tenant_id, workspace_id)`.
 Successful mutations emit:
 
 ```text
-workspace_goal.created
-workspace_goal.updated
+workspace_primary_growth_goal.created
+workspace_primary_growth_goal.updated
 ```
 
-The resource type is `workspace_goal`, resource ID is the goal UUID, and optional `actor_id` is
-provider-neutral attribution. Audit `details` is exactly:
+The resource type is `workspace_primary_growth_goal`, resource ID is the goal UUID, and optional
+`actor_id` is provider-neutral attribution. Audit `details` is exactly:
 
 ```python
 details = {
@@ -195,14 +203,14 @@ internally; validate request shape at the API boundary and enforce ownership/car
 PostgreSQL.
 
 ```python
-class WorkspaceGoalUpdate(StrictInput):
+class WorkspacePrimaryGrowthGoalUpdate(StrictInput):
     objective: str | None = Field(default=None, min_length=1, max_length=2000)
-    success_definition: str | None = Field(default=None, min_length=1, max_length=4000)
+    success_definition: str | None = Field(default=None, min_length=1, max_length=2000)
     target_date: date | None = None
     actor_id: UUID | None = None
 
     @model_validator(mode="after")
-    def includes_goal_change(self) -> "WorkspaceGoalUpdate":
+    def includes_goal_change(self) -> "WorkspacePrimaryGrowthGoalUpdate":
         supplied = self.model_fields_set - {"actor_id"}
         if not supplied:
             raise ValueError("At least one goal field must be updated")
@@ -249,8 +257,9 @@ deterministic assertions.
 Create the additive table, matching ORM model, composite ownership constraint, and uniqueness
 constraint. It depends only on the existing workspace schema.
 
-Acceptance: metadata and migration agree; upgrade/downgrade SQL is limited to `workspace_goals`;
-direct database tests prove one-per-workspace and same-tenant constraints.
+Acceptance: metadata and migration agree; upgrade/downgrade SQL is limited to
+`workspace_primary_growth_goals`; direct database tests prove one-per-workspace and same-tenant
+constraints.
 
 Verification: run focused database tests, render both SQL directions, and exercise the migration
 round trip on disposable PostgreSQL.
@@ -289,7 +298,7 @@ Dependencies: Task 3 supplies all business behavior.
 Acceptance: status codes, response shape, validation, not-found non-disclosure, and duplicate
 conflict match this contract for the full request-to-database path.
 
-Verification: run the entire workspace-goal API suite.
+Verification: run the entire workspace-primary-growth-goal API suite.
 
 ### Checkpoint: Focused vertical slice
 
@@ -333,7 +342,7 @@ and request a fresh read-only review before opening/updating the draft PR.
 
 ### Always
 
-- Keep every parent lookup and goal query explicitly tenant/workspace scoped.
+- Keep every parent lookup and primary-growth-goal query explicitly tenant/workspace scoped.
 - Enforce same-tenant ownership and one-goal cardinality in PostgreSQL and service behavior.
 - Use bounded structured columns, strict schemas, and a typed calendar date.
 - Atomically commit each mutation with exactly one field-name-only audit event.
@@ -362,7 +371,7 @@ and request a fresh read-only review before opening/updating the draft PR.
 
 - Cardinality: zero or one primary goal per workspace; create conflicts once one exists.
 - Required field: create requires a non-blank objective bounded at 2,000 characters.
-- Optional fields: success definition is bounded at 4,000 characters; target date is a date without
+- Optional fields: success definition is bounded at 2,000 characters; target date is a date without
   server-clock validation. Explicit null clears either optional field.
 - Patch: at least one goal field is supplied; omissions preserve stored values; objective cannot
   be null; actor attribution alone is not a mutation.
@@ -371,8 +380,8 @@ and request a fresh read-only review before opening/updating the draft PR.
   values are forbidden. Optional actor ID is attribution, not goal content.
 - Isolation: composite ownership plus tenant-scoped service queries; missing and cross-tenant
   resources share `not_found` behavior.
-- API: singular `/goal` has POST/GET/PATCH only. POST is 201; GET/PATCH are 200; duplicates are
-  `conflict`.
+- API: singular `/primary-growth-goal` has POST/GET/PATCH only. POST is 201; GET/PATCH are 200;
+  duplicates are `conflict`.
 - Architecture: extend current explicit model/schema/repository/service/router modules and the
   append-only audit ledger. No generic abstraction or dependency is justified.
 - Scope: persistence and retrieval only. No delete, measurement, execution, agents, integration,
@@ -398,7 +407,7 @@ and request a fresh read-only review before opening/updating the draft PR.
 ## Risks
 
 - Cross-tenant disclosure or association: mitigate with composite database ownership, scoped
-  parent/goal queries, identical not-found responses, and direct bypass tests.
+  parent and primary-growth-goal queries, identical not-found responses, and direct bypass tests.
 - Duplicate/concurrent creation: enforce uniqueness in PostgreSQL and map the integrity failure to
   the stable conflict response.
 - Sensitive intent leaking through audits: construct a fixed details allowlist and assert that no
@@ -410,18 +419,18 @@ and request a fresh read-only review before opening/updating the draft PR.
 
 ## Rollback and Recovery
 
-Application rollback while retaining `workspace_goals` is preferred: revert or disable the
-PRODUCT-002 application paths to stop new goal operations while preserving the additive table and
-all stored goal data. This is the safe default for shared or production databases.
+Application rollback while retaining `workspace_primary_growth_goals` is preferred: revert or
+disable the PRODUCT-002 application paths to stop new goal operations while preserving the
+additive table and all stored goal data. This is the safe default for shared or production
+databases.
 
-Only in a disposable development database, downgrade one revision to drop `workspace_goals`, then
-re-upgrade after correction. Downgrade deletes all stored goal data. Before any approved downgrade
-against meaningful shared or production data, obtain explicit approval, take and verify a backup,
-and document and test recovery.
+Only in a disposable development database, downgrade one revision to drop
+`workspace_primary_growth_goals`, then re-upgrade after correction. Downgrade deletes all stored
+goal data. Before any approved downgrade against meaningful shared or production data, obtain
+explicit approval, take and verify a backup, and document and test recovery.
 
-PLANNING-002 itself is documentation-only. Revert its planning commit to remove this unimplemented
-specification and restore PRODUCT-001 as the recorded current task; it has no runtime, schema,
-production, or external rollback.
+PLANNING-003 is a documentation-only correction. Revert the PLANNING-003 correction commit to
+restore the prior documentation; it has no runtime, schema, data, production, or external effect.
 
 ## Open Questions
 
