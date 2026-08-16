@@ -150,6 +150,64 @@ class ExecutionService:
         await self.repository.refresh(run)
         return JobResult(job, run, False)
 
+    async def reserve_retry(
+        self,
+        context: TenantContext,
+        job_id: UUID,
+        *,
+        expected_attempt_number: int,
+        actor_id: UUID | None,
+    ) -> JobResult:
+        job = await self.get_owned(ExecutionJob, context, job_id)
+        prior_run = await self._required_run(context, job.id)
+        if (
+            job.status is not ExecutionStatus.FAILED
+            or prior_run.status is not ExecutionStatus.FAILED
+            or prior_run.attempt_number != expected_attempt_number
+            or prior_run.attempt_number >= prior_run.max_attempts
+        ):
+            raise InvalidStateTransitionError()
+
+        job_updated = await self.repository.compare_and_set_job_status(
+            context, job.id, ExecutionStatus.FAILED, ExecutionStatus.QUEUED
+        )
+        if not job_updated:
+            await self.repository.rollback()
+            raise InvalidStateTransitionError()
+
+        new_run = ExecutionRun(
+            tenant_id=context.tenant_id,
+            job_id=job.id,
+            status=ExecutionStatus.QUEUED,
+            attempt_number=prior_run.attempt_number + 1,
+            max_attempts=prior_run.max_attempts,
+            retry_delay_seconds=prior_run.retry_delay_seconds,
+            last_error_code=None,
+        )
+        audit = self._audit(
+            context,
+            "execution_job.retry_reserved",
+            "execution_job",
+            job.id,
+            actor_id=actor_id,
+            details={
+                "prior_run_id": str(prior_run.id),
+                "new_run_id": str(new_run.id),
+                "prior_attempt_number": prior_run.attempt_number,
+                "new_attempt_number": new_run.attempt_number,
+            },
+        )
+        try:
+            new_run = await self.repository.insert_run(new_run)
+            self.repository.add_all(audit)
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            raise InvalidStateTransitionError() from error
+        await self.repository.refresh(job)
+        await self.repository.refresh(new_run)
+        return JobResult(job, new_run, False)
+
     async def list_jobs(
         self, context: TenantContext, *, limit: int, offset: int
     ) -> tuple[list[JobResult], int]:

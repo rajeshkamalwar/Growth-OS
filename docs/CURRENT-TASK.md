@@ -1,36 +1,36 @@
 # Current Task
 
 ## Task ID
-FOUNDATION-008 (GitHub issue #20)
+FOUNDATION-009 (GitHub issue #22)
 
 ## Authorization
-Add atomic, auditable execution lifecycle transitions to the existing control plane.
+Add a bounded, auditable manual retry reservation to the existing execution control plane.
 
 ## Goal
-Allow a tenant-scoped caller to transition an execution job and its latest run together using
-the canonical state graph and compare-and-set status guards.
+Allow a tenant-scoped caller to atomically re-queue a failed execution job and reserve exactly
+one next queued run without executing work.
 
 ## Required Outcome
-- A strict request supplies `expected_status`, `target_status`, and optional provider-neutral
-  `actor_id`.
-- The tenant-owned job and latest run must both match the expected status.
-- Both records change atomically through compare-and-set updates.
-- Exactly one append-only audit event records each successful transition, including the prior
-  status, target status, latest-run identifier, and optional actor attribution.
-- Invalid, stale, inconsistent, or already-consumed transitions fail closed with
-  `invalid_state_transition` and no partial update or audit event.
+- A strict request supplies `expected_attempt_number` and optional provider-neutral `actor_id`.
+- The tenant-owned job and latest run must both be failed, the attempt expectation must be current,
+  and another bounded attempt must remain.
+- A compare-and-set update re-queues the job and one new run increments the attempt by exactly one.
+- The new run copies `max_attempts` and `retry_delay_seconds`, and clears `last_error_code`.
+- The failed prior run remains immutable execution history.
+- Exactly one append-only `execution_job.retry_reserved` audit event records the prior and new run
+  identifiers and attempt numbers, with optional actor attribution.
+- Invalid, stale, duplicate, exhausted, inconsistent, missing, or cross-tenant requests fail closed
+  with no partial state or audit event.
 
 ## Constraints
-- Do not add workers, scheduling, retry-attempt creation, Temporal, or external actions.
+- Do not execute work or add automatic scheduling, retry-delay enforcement, workers, or Temporal.
 - Do not add or change database schema or migrations.
-- Do not change proposal approval semantics, authentication, authorization, tenant isolation,
-  billing, secrets, production infrastructure, or deployment behavior.
-- Preserve existing job creation, idempotency, proposal, and approval behavior.
+- Do not change the run transition graph, proposal approvals, authentication, authorization, tenant
+  isolation, billing, secrets, production infrastructure, or deployment behavior.
 
 ## Completion Gates
-- Deterministic tests cover every allowed state edge, invalid and terminal transitions, stale and
-  competing attempts, rollback, audit details and actor attribution, and tenant isolation.
-- Ruff format/lint, strict mypy, pytest, pip-audit, migration validation, and
-  `git diff --check` pass.
+- Deterministic tests cover success, preserved history, bounds, stale and competing calls, rollback,
+  audit details and attribution, strict validation, and tenant isolation.
+- Ruff format/lint, strict mypy, pytest, pip-audit, migration validation, and `git diff --check` pass.
 - A separate read-only reviewer reports zero blocking findings.
 - Work is delivered from a dedicated task branch through a draft pull request.

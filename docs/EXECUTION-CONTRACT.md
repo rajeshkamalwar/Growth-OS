@@ -64,13 +64,45 @@ transaction. Its details contain `prior_status`, `target_status`, and `run_id`; 
 recorded when supplied. The response is the existing execution-job contract with the updated
 latest run.
 
-The `decided_by` and transition `actor_id` identifiers are provider-neutral audit attribution,
-not a new authorization system. The existing tenant-context boundary remains unchanged.
+## Manual Retry Reservation
+
+`POST /api/v1/tenants/{tenant_id}/execution-jobs/{job_id}/retries` accepts a strict body:
+
+```json
+{
+  "expected_attempt_number": 1,
+  "actor_id": "optional-provider-neutral-uuid"
+}
+```
+
+The tenant-owned job and its latest run are resolved in the request transaction. Both must be
+`failed`, the latest run must match `expected_attempt_number`, and its `attempt_number` must be
+less than `max_attempts`. The operation compare-and-sets the job from `failed` to `queued`, inserts
+exactly one queued run at the next attempt, and commits both changes with one audit event. The new
+run copies `max_attempts` and `retry_delay_seconds` from the prior run and has no
+`last_error_code`. It reserves state only and never executes work or enforces retry timing.
+
+The prior failed run is terminal and remains unchanged in execution history; retry reservation is
+not an edge in the individual-run transition graph. Stale, repeated, exhausted, non-failed, or
+inconsistent requests return `invalid_state_transition`. The compare-and-set job guard and the
+existing unique job-attempt constraint prevent competing calls from both succeeding. Missing and
+cross-tenant jobs retain `not_found` behavior. Any failed insert or commit rolls back the job
+update, new run, and audit event.
+
+A successful reservation returns the existing execution-job response with the new run as
+`latest_run` and appends exactly one `execution_job.retry_reserved` event. Its details contain
+`prior_run_id`, `new_run_id`, `prior_attempt_number`, and `new_attempt_number`; `actor_id` is stored
+when provided.
+
+The `decided_by`, transition `actor_id`, and retry `actor_id` identifiers are provider-neutral
+audit attribution, not a new authorization system. The existing tenant-context boundary remains
+unchanged.
 
 ## Rollback
 
-FOUNDATION-008 has no migration. Revert its implementation commit to remove the transition
-endpoint and stop new transition audit events. Existing job, run, and audit rows remain valid;
-successful transitions already committed are historical state and are not reversed by the code
-rollback. The earlier additive migration rollback remains available, but dropping those tables
-would delete control-plane history and requires a backup first.
+FOUNDATION-008 and FOUNDATION-009 have no migrations. Revert their respective implementation
+commits to remove the transition or retry endpoint and stop its new audit events. Existing job,
+run, and audit rows remain valid; successful transitions and retry reservations already committed
+are historical state and are not reversed by the code rollback. The earlier additive migration
+rollback remains available, but dropping those tables would delete control-plane history and
+requires a backup first.

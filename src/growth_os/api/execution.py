@@ -14,6 +14,7 @@ from growth_os.api.schemas import (
     AuditEventResponse,
     ExecutionJobCreate,
     ExecutionJobResponse,
+    ExecutionRetryCreate,
     ExecutionRunResponse,
     ExecutionTransitionCreate,
     Page,
@@ -114,6 +115,24 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
             resource_id,
             expected_status=payload.expected_status,
             target_status=payload.target_status,
+            actor_id=payload.actor_id,
+        )
+        return job_response(result)
+
+    @router.post(
+        "/tenants/{tenant_id}/execution-jobs/{resource_id}/retries",
+        response_model=ExecutionJobResponse,
+    )
+    async def retry_job(
+        resource_id: UUID,
+        payload: ExecutionRetryCreate,
+        context: Context,
+        session: Session,
+    ) -> ExecutionJobResponse:
+        result = await service(session).reserve_retry(
+            context,
+            resource_id,
+            expected_attempt_number=payload.expected_attempt_number,
             actor_id=payload.actor_id,
         )
         return job_response(result)

@@ -1,7 +1,7 @@
 from typing import TypeVar, cast
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from growth_os.db.base import Base
@@ -93,6 +93,25 @@ class ExecutionRepository:
             .returning(ExecutionRun.id)
         )
         return updated_id is not None
+
+    async def insert_run(self, run: ExecutionRun) -> ExecutionRun:
+        return cast(
+            ExecutionRun,
+            await self.session.scalar(
+                insert(ExecutionRun)
+                .values(
+                    id=run.id,
+                    tenant_id=run.tenant_id,
+                    job_id=run.job_id,
+                    status=run.status,
+                    attempt_number=run.attempt_number,
+                    max_attempts=run.max_attempts,
+                    retry_delay_seconds=run.retry_delay_seconds,
+                    last_error_code=run.last_error_code,
+                )
+                .returning(ExecutionRun)
+            ),
+        )
 
     async def list_jobs_with_latest_runs(
         self,
