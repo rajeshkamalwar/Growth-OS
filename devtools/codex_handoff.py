@@ -9,6 +9,7 @@ Safety properties:
 - Uses `codex exec --sandbox workspace-write`.
 - Creates a task branch, commit, push, and draft PR.
 - Never merges or deploys.
+- Writes runtime status/logs under `.git` so monitoring never dirties the repository.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = os.environ.get("GROWTH_OS_REPO", "rajeshkamalwar/Growth-OS")
@@ -28,6 +30,12 @@ RUNNING_LABEL = "codex-running"
 DONE_LABEL = "codex-pr-open"
 FAILED_LABEL = "codex-failed"
 LOCK_FILE = Path(".git/codex-handoff.lock")
+STATUS_FILE = Path(".git/codex-handoff-status.json")
+LOG_DIR = Path(".git/codex-handoff-logs")
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def run(*args: str, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -82,6 +90,66 @@ def acquire_lock() -> None:
 
 def release_lock() -> None:
     LOCK_FILE.unlink(missing_ok=True)
+
+
+def write_status(
+    state: str,
+    *,
+    issue: int | None = None,
+    title: str | None = None,
+    branch: str | None = None,
+    log_file: Path | None = None,
+    started_at: str | None = None,
+    detail: str | None = None,
+    codex_pid: int | None = None,
+    pr_url: str | None = None,
+) -> None:
+    previous: dict[str, object] = {}
+    if STATUS_FILE.exists():
+        try:
+            previous = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            previous = {}
+    payload = {
+        "state": state,
+        "issue": issue if issue is not None else previous.get("issue"),
+        "title": title if title is not None else previous.get("title"),
+        "branch": branch if branch is not None else previous.get("branch"),
+        "started_at": started_at if started_at is not None else previous.get("started_at"),
+        "updated_at": now_iso(),
+        "controller_pid": os.getpid(),
+        "codex_pid": codex_pid,
+        "log_file": str(log_file) if log_file else previous.get("log_file"),
+        "detail": detail,
+        "pr_url": pr_url if pr_url is not None else previous.get("pr_url"),
+    }
+    STATUS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def show_status() -> int:
+    if not STATUS_FILE.exists():
+        print("No handoff status has been recorded yet.")
+        return 0
+    data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    print(f"State: {data.get('state', 'UNKNOWN')}")
+    if data.get("issue"):
+        print(f"Issue: #{data['issue']} — {data.get('title', '')}")
+    if data.get("branch"):
+        print(f"Branch: {data['branch']}")
+    if data.get("started_at"):
+        print(f"Started: {data['started_at']}")
+    if data.get("updated_at"):
+        print(f"Last update: {data['updated_at']}")
+    if data.get("codex_pid"):
+        print(f"Codex PID: {data['codex_pid']}")
+    if data.get("pr_url"):
+        print(f"PR: {data['pr_url']}")
+    if data.get("detail"):
+        print(f"Detail: {data['detail']}")
+    if data.get("log_file"):
+        print(f"Log: {data['log_file']}")
+        print(f"Watch: tail -f {data['log_file']}")
+    return 0
 
 
 def next_issue() -> dict | None:
@@ -142,15 +210,50 @@ def reset_noop_branch(branch: str) -> None:
     subprocess.run(["git", "branch", "-D", branch], capture_output=True, text=True)
 
 
+def run_codex_stream(prompt: str, log_file: Path, status_context: dict[str, object]) -> tuple[int, str]:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    tail: list[str] = []
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            ["codex", "exec", "--sandbox", "workspace-write"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        write_status("CODING", codex_pid=process.pid, log_file=log_file, **status_context)
+        assert process.stdin is not None
+        process.stdin.write(prompt)
+        process.stdin.close()
+        assert process.stdout is not None
+        for line in process.stdout:
+            log.write(line)
+            log.flush()
+            tail.append(line)
+            if len(tail) > 100:
+                tail.pop(0)
+        return_code = process.wait()
+    return return_code, "".join(tail)
+
+
 def process_issue(issue: dict) -> None:
     number = int(issue["number"])
     title = issue["title"]
     body = issue.get("body") or ""
     branch = f"codex/issue-{number}-{slugify(title)}"
+    started_at = now_iso()
+    log_file = LOG_DIR / f"handoff-{number}.log"
+    status_context: dict[str, object] = {
+        "issue": number,
+        "title": title,
+        "branch": branch,
+        "started_at": started_at,
+    }
 
+    write_status("SYNCING", log_file=log_file, detail="Preparing task branch", **status_context)
     label(number, add=RUNNING_LABEL, remove=READY_LABEL)
     comment(number, f"Local Codex controller started this task on branch `{branch}`.")
-
     prepare_task_branch(branch)
 
     prompt = f"""You are the implementation agent for this repository.
@@ -180,23 +283,25 @@ Completion expectation:
 Finish with a concise implementation summary covering files changed, architecture choices, checks run and results, acceptance-criteria status, risks/limitations, and rollback notes.
 """
 
-    result = run("codex", "exec", "--sandbox", "workspace-write", input_text=prompt, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"Codex exited with {result.returncode}:\n{result.stderr[-3000:]}")
+    return_code, output_tail = run_codex_stream(prompt, log_file, status_context)
+    if return_code != 0:
+        raise RuntimeError(f"Codex exited with {return_code}:\n{output_tail[-3000:]}")
 
     changed = run("git", "status", "--porcelain").stdout.strip()
     if not changed:
-        output = (result.stdout or "").strip()
         reset_noop_branch(branch)
         raise RuntimeError(
             "Codex returned successfully but produced no repository changes for an implementation task. "
-            "The controller now treats this as a failed handoff so the task can be reviewed/requeued instead "
+            "The controller treats this as a failed handoff so the task can be reviewed/requeued instead "
             "of being falsely marked complete.\n\n"
-            f"Codex output:\n{output[-3000:]}"
+            f"Codex output:\n{output_tail[-3000:]}"
         )
 
+    write_status("COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context)
     run("git", "add", "-A")
     run("git", "commit", "-m", f"codex: resolve issue #{number}")
+
+    write_status("PUSHING", log_file=log_file, detail="Pushing task branch", **status_context)
     run("git", "push", "-u", "origin", branch)
 
     pr_body = (
@@ -210,6 +315,7 @@ Finish with a concise implementation summary covering files changed, architectur
         "--title", f"{title}", "--body", pr_body,
     ).stdout.strip()
 
+    write_status("PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context)
     comment(number, f"Codex completed and opened draft PR: {pr_url}")
     label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
 
@@ -222,6 +328,7 @@ def run_once() -> int:
     try:
         issue = next_issue()
         if issue is None:
+            write_status("IDLE", detail="No codex-ready issues found")
             print("No codex-ready issues found.")
             return 0
         try:
@@ -229,6 +336,7 @@ def run_once() -> int:
             return 0
         except Exception as exc:
             number = int(issue["number"])
+            write_status("FAILED", issue=number, title=issue.get("title"), detail=str(exc)[-1000:])
             label(number, add=FAILED_LABEL, remove=RUNNING_LABEL)
             comment(number, f"Local Codex controller failed:\n\n```text\n{str(exc)[-3000:]}\n```")
             raise
@@ -239,9 +347,13 @@ def run_once() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Process at most one ready issue and exit")
+    parser.add_argument("--status", action="store_true", help="Show the latest local handoff status")
     args = parser.parse_args()
+
+    if args.status:
+        return show_status()
     if not args.once:
-        print("For safety, this first version only supports --once. Use a scheduler/launchd to invoke it repeatedly.")
+        print("Use --once to process one ready issue or --status to inspect the latest handoff.")
         return 2
     try:
         return run_once()
