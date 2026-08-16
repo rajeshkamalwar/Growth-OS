@@ -125,6 +125,12 @@ class ExecutionJobCreate(StrictInput):
     retry_delay_seconds: int = Field(default=0, ge=0, le=86400)
 
 
+class ExecutionTransitionCreate(StrictInput):
+    expected_status: ExecutionStatus
+    target_status: ExecutionStatus
+    actor_id: UUID | None = None
+
+
 class ExecutionRunResponse(AuditFields):
     tenant_id: UUID
     job_id: UUID
