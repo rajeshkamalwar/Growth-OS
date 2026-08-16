@@ -5,17 +5,25 @@ Remove manual copy/paste between ChatGPT and Codex without depending on paid Git
 
 The flow is:
 
-`ChatGPT -> GitHub issue -> local controller on your Mac -> Codex CLI -> branch -> draft PR -> GitHub -> ChatGPT review`
+`Goal -> GitHub issue -> local controller -> implement -> verify -> draft PR -> review/fix loop`
 
 ## One-time prerequisites
 
 1. Clone the repository on the Mac that will run Codex.
 2. Install and authenticate GitHub CLI (`gh`).
 3. Install and authenticate Codex CLI.
-4. Keep the repository checkout clean when the controller runs.
+4. Create the Python 3.12 verification environment:
 
-The controller uses the repository's existing `AGENTS.md` safety contract. This milestone
-creates draft PRs but does not review, merge, or deploy them.
+   ```bash
+   python3.12 -m venv .venv
+   .venv/bin/pip install -e '.[dev]'
+   ```
+
+5. Keep the repository checkout clean when the controller runs.
+
+The controller uses the repository's existing `AGENTS.md` safety contract. It creates draft
+PRs, runs deterministic local gates, performs an independent read-only review, and may apply up
+to two verified fix rounds. It does not merge or deploy.
 
 ## Install Codex CLI
 
@@ -72,22 +80,31 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 2. The issue is explicitly marked `codex-ready`.
 3. The local controller creates a branch from fresh `main`.
 4. It passes the issue plus repository rules to `codex exec --sandbox workspace-write`.
-5. Codex implements and tests locally.
-6. The controller commits and pushes the result.
-7. The controller opens a draft PR and posts the PR link back to the issue.
-8. The issue receives `codex-pr-open`.
-9. ChatGPT can inspect the PR directly through GitHub.
-10. Review and merge automation is a separate milestone; this controller stops at a draft PR.
+5. Codex implements the issue in workspace-write mode.
+6. The controller runs Ruff lint/format, strict mypy, pytest, pip-audit, offline Alembic
+   upgrade/downgrade SQL, and `git diff --check` without a shell.
+7. The controller commits, pushes, and opens a draft PR.
+8. A fresh Codex reviewer inspects the branch against `origin/main` in read-only mode and
+   returns a bounded structured result.
+9. Findings trigger at most two workspace-write fix rounds. Every round is fully reverified,
+   committed, pushed to the same draft PR, and reviewed again.
+10. A zero-finding review records `REVIEW_PASSED` and applies `codex-pr-open`. Any invalid output,
+    failed gate, no-change fix, or exhausted loop records failure and stops.
+11. Automatic merge remains a separate milestone; this controller stops at the reviewed draft
+    PR.
 
 ## Safety rules
 
-- No automatic review or merge in the current controller.
+- No automatic merge in the current controller.
 - No automatic production deployment.
 - Only issues explicitly labeled `codex-ready` run.
 - Only the configured repository owner's issues are accepted.
 - Dirty working trees are rejected.
 - Only one task runs at a time.
 - Codex runs in workspace-write sandbox mode.
+- Review runs in a separate read-only Codex process.
+- Reviewer output is size-bounded, schema-constrained, and validated before it reaches a fixer.
+- The fix loop is capped at two rounds and every change must pass the full local gate set.
 - `AGENTS.md` remains authoritative.
 - Approval-gated architecture/auth/billing/tenant/destructive changes remain blocked.
 

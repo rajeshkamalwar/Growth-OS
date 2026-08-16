@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -197,3 +198,367 @@ def test_run_once_preserves_idle_behavior_and_releases_lock(
     assert codex_handoff.run_once() == 0
     assert not lock_file.exists()
     assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "IDLE"
+
+
+def review_result(*, verdict: str, findings: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "verdict": verdict,
+        "summary": "Independent review completed.",
+        "findings": findings,
+    }
+
+
+def finding(title: str = "Fix the defect") -> dict[str, object]:
+    return {
+        "priority": "P1",
+        "title": title,
+        "detail": "The behavior violates the issue contract.",
+        "path": "devtools/codex_handoff.py",
+        "line": 100,
+    }
+
+
+def test_load_review_result_accepts_clean_pass(tmp_path: Path) -> None:
+    result_file = tmp_path / "review.json"
+    result_file.write_text(json.dumps(review_result(verdict="pass", findings=[])), encoding="utf-8")
+
+    result = codex_handoff.load_review_result(result_file)
+
+    assert result["verdict"] == "pass"
+    assert result["findings"] == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        json.dumps({"verdict": "pass", "summary": "ok"}),
+        json.dumps(review_result(verdict="pass", findings=[finding()])),
+        json.dumps(review_result(verdict="changes_requested", findings=[])),
+        json.dumps(review_result(verdict="approve", findings=[])),
+        json.dumps(review_result(verdict=[], findings=[])),
+        json.dumps(
+            review_result(
+                verdict="changes_requested",
+                findings=[{**finding(), "priority": "P4"}],
+            )
+        ),
+        json.dumps(
+            review_result(
+                verdict="changes_requested",
+                findings=[{**finding(), "priority": []}],
+            )
+        ),
+    ],
+)
+def test_load_review_result_rejects_invalid_contract(payload: str, tmp_path: Path) -> None:
+    result_file = tmp_path / "review.json"
+    result_file.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="review result"):
+        codex_handoff.load_review_result(result_file)
+
+
+def test_load_review_result_rejects_oversized_output(tmp_path: Path) -> None:
+    result_file = tmp_path / "review.json"
+    result_file.write_text("x" * 65_537, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="review result.*large"):
+        codex_handoff.load_review_result(result_file)
+
+
+def test_review_fix_loop_passes_without_starting_fixer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issue = {"number": 16, "title": "Task", "body": "Contract"}
+    status_context = {
+        "issue": 16,
+        "title": "Task",
+        "branch": "codex/task",
+        "started_at": "now",
+    }
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_reviewer",
+        lambda _issue, _context, _round: review_result(verdict="pass", findings=[]),
+    )
+    fixer_rounds: list[int] = []
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_fixer",
+        lambda _issue, _findings, _context, fix_round: fixer_rounds.append(fix_round),
+    )
+
+    result = codex_handoff.run_review_fix_loop(issue, status_context)
+
+    assert result["verdict"] == "pass"
+    assert fixer_rounds == []
+
+
+def test_review_fix_loop_fixes_verifies_commits_and_reviews_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issue = {"number": 16, "title": "Task", "body": "Contract"}
+    status_context = {
+        "issue": 16,
+        "title": "Task",
+        "branch": "codex/task",
+        "started_at": "now",
+    }
+    results = iter(
+        [
+            review_result(verdict="changes_requested", findings=[finding()]),
+            review_result(verdict="pass", findings=[]),
+        ]
+    )
+    monkeypatch.setattr(
+        codex_handoff, "run_reviewer", lambda _issue, _context, _round: next(results)
+    )
+    events: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_fixer",
+        lambda _issue, _findings, _context, fix_round: events.append(("fix", fix_round)),
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_verification",
+        lambda _issue, _context, pass_number: events.append(("verify", pass_number)),
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "commit_review_fix",
+        lambda _issue, fix_round: events.append(("commit", fix_round)),
+    )
+
+    result = codex_handoff.run_review_fix_loop(issue, status_context)
+
+    assert result["verdict"] == "pass"
+    assert events == [("fix", 1), ("verify", 2), ("commit", 1)]
+
+
+def test_review_fix_loop_stops_after_two_fix_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issue = {"number": 16, "title": "Task", "body": "Contract"}
+    status_context = {
+        "issue": 16,
+        "title": "Task",
+        "branch": "codex/task",
+        "started_at": "now",
+    }
+    review_rounds: list[int] = []
+
+    def request_changes(
+        _issue: dict[str, object], _context: dict[str, object], review_round: int
+    ) -> dict[str, object]:
+        review_rounds.append(review_round)
+        return review_result(verdict="changes_requested", findings=[finding()])
+
+    fixer_rounds: list[int] = []
+    monkeypatch.setattr(codex_handoff, "run_reviewer", request_changes)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_fixer",
+        lambda _issue, _findings, _context, fix_round: fixer_rounds.append(fix_round),
+    )
+    monkeypatch.setattr(codex_handoff, "run_verification", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "commit_review_fix", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="two fix rounds"):
+        codex_handoff.run_review_fix_loop(issue, status_context)
+
+    assert review_rounds == [1, 2, 3]
+    assert fixer_rounds == [1, 2]
+
+
+def test_run_reviewer_stops_on_command_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    commands: list[tuple[str, ...]] = []
+    environments: list[dict[str, str]] = []
+
+    def fail_reviewer(*_args: object, **kwargs: object) -> tuple[int, str]:
+        commands.append(kwargs["command"])
+        environments.append(kwargs["env"])
+        return 7, "review process failed"
+
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_codex_stream",
+        fail_reviewer,
+    )
+
+    with pytest.raises(RuntimeError, match="Reviewer exited with 7"):
+        codex_handoff.run_reviewer(
+            {"number": 16, "title": "Task", "body": "Contract"},
+            {"issue": 16, "title": "Task", "branch": "codex/task", "started_at": "now"},
+            1,
+        )
+
+    assert commands[0][:4] == ("codex", "exec", "--sandbox", "read-only")
+    assert "review" not in commands[0]
+    assert "--add-dir" in commands[0]
+    assert not Path(environments[0]["TMPDIR"]).exists()
+
+
+def test_run_fixer_stops_when_no_changes_are_produced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_codex_stream",
+        lambda *_args, **_kwargs: (0, "fixer completed"),
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="fixer produced no changes"):
+        codex_handoff.run_fixer(
+            {"number": 16, "title": "Task", "body": "Contract"},
+            [finding()],
+            {"issue": 16, "title": "Task", "branch": "codex/task", "started_at": "now"},
+            1,
+        )
+
+
+def test_run_verification_fails_closed_on_first_failed_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime_paths: tuple[Path, Path]
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setenv("GROWTH_OS_DATABASE_URL", "postgresql://production.example/growth_os")
+    commands: list[tuple[str, ...]] = []
+    environments: list[dict[str, str]] = []
+
+    def fail_pytest(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        environments.append(kwargs["env"])
+        return subprocess.CompletedProcess(
+            args,
+            1 if args[:2] == (".venv/bin/python", "-m") and "pytest" in args else 0,
+            stdout="verification output",
+            stderr="verification error",
+        )
+
+    monkeypatch.setattr(codex_handoff, "run", fail_pytest)
+
+    with pytest.raises(RuntimeError, match="Local verification failed.*pytest"):
+        codex_handoff.run_verification(
+            {"number": 16, "title": "Task", "body": "Contract"},
+            {"issue": 16, "title": "Task", "branch": "codex/task", "started_at": "now"},
+            1,
+        )
+
+    assert all(isinstance(argument, str) for command in commands for argument in command)
+    assert all(
+        environment["GROWTH_OS_DATABASE_URL"] == codex_handoff.LOCAL_DATABASE_URL
+        for environment in environments
+    )
+
+
+def test_process_issue_verifies_before_pr_then_completes_independent_review(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "prepare_task_branch", lambda _branch: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_codex_stream",
+        lambda *_args, **_kwargs: (0, "implementation completed"),
+    )
+    events: list[str] = []
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args == ("git", "status", "--porcelain"):
+            return subprocess.CompletedProcess(args, 0, stdout=" M changed.py\n", stderr="")
+        if args[:3] == ("git", "commit", "-m"):
+            events.append("commit")
+        if args[:3] == ("gh", "pr", "create"):
+            events.append("pr")
+            return subprocess.CompletedProcess(
+                args, 0, stdout="https://github.com/example/repo/pull/1\n", stderr=""
+            )
+        if args[:3] == ("gh", "pr", "edit"):
+            events.append("mark-pr")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_verification",
+        lambda _issue, _context, _pass_number: events.append("verify"),
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_review_fix_loop",
+        lambda _issue, _context: (
+            events.append("review") or review_result(verdict="pass", findings=[])
+        ),
+    )
+    labels: list[tuple[str | None, str | None]] = []
+    monkeypatch.setattr(
+        codex_handoff,
+        "label",
+        lambda _number, add=None, remove=None: labels.append((add, remove)),
+    )
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "write_status", lambda *_args, **_kwargs: None)
+
+    codex_handoff.process_issue({"number": 16, "title": "Task", "body": "Contract"})
+
+    assert events == ["verify", "commit", "pr", "review", "mark-pr"]
+    assert (codex_handoff.REVIEWED_LABEL, None) in labels
+    assert labels[-1] == (codex_handoff.DONE_LABEL, codex_handoff.RUNNING_LABEL)
+
+
+def test_process_issue_does_not_mark_pr_when_review_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "prepare_task_branch", lambda _branch: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_codex_stream",
+        lambda *_args, **_kwargs: (0, "implementation completed"),
+    )
+    pr_marked = False
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal pr_marked
+        if args == ("git", "status", "--porcelain"):
+            return subprocess.CompletedProcess(args, 0, stdout=" M changed.py\n", stderr="")
+        if args[:3] == ("gh", "pr", "create"):
+            return subprocess.CompletedProcess(
+                args, 0, stdout="https://github.com/example/repo/pull/1\n", stderr=""
+            )
+        if args[:3] == ("gh", "pr", "edit"):
+            pr_marked = True
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    monkeypatch.setattr(codex_handoff, "run_verification", lambda *_args: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_review_fix_loop",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("review failed")),
+    )
+    labels: list[tuple[str | None, str | None]] = []
+    monkeypatch.setattr(
+        codex_handoff,
+        "label",
+        lambda _number, add=None, remove=None: labels.append((add, remove)),
+    )
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "write_status", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="review failed"):
+        codex_handoff.process_issue({"number": 16, "title": "Task", "body": "Contract"})
+
+    assert not pr_marked
+    assert all(add != codex_handoff.DONE_LABEL for add, _remove in labels)
+    assert all(add != codex_handoff.REVIEWED_LABEL for add, _remove in labels)

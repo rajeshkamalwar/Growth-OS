@@ -6,8 +6,9 @@ Safety properties:
 - Only accepts issues authored by the configured repository owner.
 - Requires a clean working tree.
 - Runs one task at a time using a lock file.
-- Uses `codex exec --sandbox workspace-write`.
-- Creates a task branch, commit, push, and draft PR.
+- Uses workspace-write for implementation/fixes and read-only for independent review.
+- Runs trusted local verification after implementation and every fix round.
+- Creates a task branch, commits, pushes, and a reviewed draft PR.
 - Never merges or deploys.
 - Writes runtime status/logs under `.git` so monitoring never dirties the repository.
 """
@@ -19,8 +20,10 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,13 +34,38 @@ OWNER = os.environ.get("GROWTH_OS_OWNER", "rajeshkamalwar")
 READY_LABEL = "codex-ready"
 RUNNING_LABEL = "codex-running"
 DONE_LABEL = "codex-pr-open"
+REVIEWED_LABEL = "codex-review-passed"
 FAILED_LABEL = "codex-failed"
 LOCK_FILE = Path(".git/codex-handoff.lock")
 STATUS_FILE = Path(".git/codex-handoff-status.json")
 LOG_DIR = Path(".git/codex-handoff-logs")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REVIEW_SCHEMA_SOURCE = REPO_ROOT / "devtools" / "codex-review.schema.json"
+REVIEW_SCHEMA_RUNTIME = Path(".git/codex-handoff-review.schema.json")
+TRUSTED_REVIEW_SCHEMA = REVIEW_SCHEMA_SOURCE.read_text(encoding="utf-8")
 DEFAULT_POLL_INTERVAL = 60
 MIN_POLL_INTERVAL = 5
 MAX_POLL_INTERVAL = 3600
+MAX_FIX_ROUNDS = 2
+MAX_REVIEW_RESULT_BYTES = 65_536
+MAX_REVIEW_FINDINGS = 20
+LOCAL_DATABASE_URL = "postgresql+asyncpg://growth_os:growth_os@localhost:5432/growth_os"
+VERIFICATION_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Ruff lint", (".venv/bin/python", "-m", "ruff", "check", ".")),
+    ("Ruff format", (".venv/bin/python", "-m", "ruff", "format", "--check", ".")),
+    ("strict mypy", (".venv/bin/python", "-m", "mypy")),
+    ("pytest", (".venv/bin/python", "-m", "pytest")),
+    ("pip-audit", (".venv/bin/python", "-m", "pip_audit")),
+    (
+        "Alembic upgrade SQL",
+        (".venv/bin/python", "-m", "alembic", "upgrade", "head", "--sql"),
+    ),
+    (
+        "Alembic downgrade SQL",
+        (".venv/bin/python", "-m", "alembic", "downgrade", "head:base", "--sql"),
+    ),
+    ("git diff validation", ("git", "diff", "--check")),
+)
 _LOCK_HANDLE: TextIO | None = None
 
 
@@ -63,13 +91,30 @@ class StatusContext(TypedDict):
     started_at: str
 
 
+class ReviewFinding(TypedDict):
+    priority: str
+    title: str
+    detail: str
+    path: str | None
+    line: int | None
+
+
+class ReviewResult(TypedDict):
+    verdict: str
+    summary: str
+    findings: list[ReviewFinding]
+
+
 def now_iso() -> str:
     # timezone.utc keeps this standalone controller compatible with the documented Python 3.9.
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017
 
 
 def run(
-    *args: str, input_text: str | None = None, check: bool = True
+    *args: str,
+    input_text: str | None = None,
+    check: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -77,6 +122,7 @@ def run(
         text=True,
         capture_output=True,
         check=check,
+        env=env,
     )
 
 
@@ -90,6 +136,11 @@ def ensure_tools() -> None:
         result = subprocess.run(["which", command], capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Required command not found: {command}")
+    if not Path(".venv/bin/python").is_file():
+        raise RuntimeError(
+            "Required verification environment not found: .venv/bin/python. "
+            "Install the repository dev dependencies before running the controller."
+        )
     run("gh", "auth", "status")
 
 
@@ -98,6 +149,7 @@ def ensure_labels() -> None:
         READY_LABEL: "Ready for local Codex execution",
         RUNNING_LABEL: "Currently running in local Codex controller",
         DONE_LABEL: "Codex opened a draft PR",
+        REVIEWED_LABEL: "Independent Codex review passed with zero findings",
         FAILED_LABEL: "Codex handoff failed",
     }
     for name, description in labels.items():
@@ -325,19 +377,28 @@ def reset_noop_branch(branch: str) -> None:
     subprocess.run(["git", "branch", "-D", branch], capture_output=True, text=True)
 
 
-def run_codex_stream(prompt: str, log_file: Path, status_context: StatusContext) -> tuple[int, str]:
+def run_codex_stream(
+    prompt: str,
+    log_file: Path,
+    status_context: StatusContext,
+    *,
+    command: tuple[str, ...] = ("codex", "exec", "--sandbox", "workspace-write"),
+    state: str = "IMPLEMENTING",
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     tail: list[str] = []
     with log_file.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
-            ["codex", "exec", "--sandbox", "workspace-write"],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
-        write_status("CODING", codex_pid=process.pid, log_file=log_file, **status_context)
+        write_status(state, codex_pid=process.pid, log_file=log_file, **status_context)
         assert process.stdin is not None
         process.stdin.write(prompt)
         process.stdin.close()
@@ -350,6 +411,203 @@ def run_codex_stream(prompt: str, log_file: Path, status_context: StatusContext)
                 tail.pop(0)
         return_code = process.wait()
     return return_code, "".join(tail)
+
+
+def _review_result_error(detail: str) -> RuntimeError:
+    return RuntimeError(f"Invalid review result: {detail}")
+
+
+def load_review_result(result_file: Path) -> ReviewResult:
+    """Load and defensively validate the reviewer's untrusted final response."""
+    try:
+        size = result_file.stat().st_size
+    except OSError as exc:
+        raise _review_result_error("result file is missing or unreadable") from exc
+    if size > MAX_REVIEW_RESULT_BYTES:
+        raise _review_result_error("review result is too large")
+    try:
+        payload = json.loads(result_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeError) as exc:
+        raise _review_result_error("result is not valid UTF-8 JSON") from exc
+
+    if not isinstance(payload, dict) or set(payload) != {"verdict", "summary", "findings"}:
+        raise _review_result_error("top-level fields do not match the contract")
+    verdict = payload["verdict"]
+    summary = payload["summary"]
+    findings = payload["findings"]
+    if not isinstance(verdict, str) or verdict not in {"pass", "changes_requested"}:
+        raise _review_result_error("verdict is not allowed")
+    if not isinstance(summary, str) or not 1 <= len(summary) <= 2000:
+        raise _review_result_error("summary length is invalid")
+    if not isinstance(findings, list) or len(findings) > MAX_REVIEW_FINDINGS:
+        raise _review_result_error("findings must be a bounded list")
+
+    validated_findings: list[ReviewFinding] = []
+    expected_fields = {"priority", "title", "detail", "path", "line"}
+    for candidate in findings:
+        if not isinstance(candidate, dict) or set(candidate) != expected_fields:
+            raise _review_result_error("finding fields do not match the contract")
+        priority = candidate["priority"]
+        title = candidate["title"]
+        detail = candidate["detail"]
+        path = candidate["path"]
+        line = candidate["line"]
+        if not isinstance(priority, str) or priority not in {"P0", "P1", "P2", "P3"}:
+            raise _review_result_error("finding priority is not allowed")
+        if not isinstance(title, str) or not 1 <= len(title) <= 200:
+            raise _review_result_error("finding title length is invalid")
+        if not isinstance(detail, str) or not 1 <= len(detail) <= 2000:
+            raise _review_result_error("finding detail length is invalid")
+        if path is not None and (not isinstance(path, str) or not 1 <= len(path) <= 500):
+            raise _review_result_error("finding path is invalid")
+        if line is not None and (type(line) is not int or not 1 <= line <= 1_000_000):
+            raise _review_result_error("finding line is invalid")
+        validated_findings.append(
+            {
+                "priority": priority,
+                "title": title,
+                "detail": detail,
+                "path": path,
+                "line": line,
+            }
+        )
+
+    if verdict == "pass" and validated_findings:
+        raise _review_result_error("pass verdict cannot contain findings")
+    if verdict == "changes_requested" and not validated_findings:
+        raise _review_result_error("changes_requested verdict requires findings")
+    return {"verdict": verdict, "summary": summary, "findings": validated_findings}
+
+
+def run_verification(issue: Issue, status_context: StatusContext, pass_number: int) -> None:
+    """Run the trusted, shell-free local quality gate set."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"verify-{issue['number']}-{pass_number}.log"
+    write_status(
+        "VERIFYING",
+        log_file=log_file,
+        detail=f"Running local verification pass {pass_number}",
+        **status_context,
+    )
+    environment = os.environ.copy()
+    environment["GROWTH_OS_DATABASE_URL"] = LOCAL_DATABASE_URL
+    with log_file.open("w", encoding="utf-8") as log:
+        for name, command in VERIFICATION_COMMANDS:
+            log.write(f"$ {json.dumps(command)}\n")
+            result = run(*command, check=False, env=environment)
+            log.write(result.stdout)
+            log.write(result.stderr)
+            log.flush()
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Local verification failed during {name} with exit code "
+                    f"{result.returncode}. See {log_file}."
+                )
+
+
+def run_reviewer(issue: Issue, status_context: StatusContext, review_round: int) -> ReviewResult:
+    """Run an independent read-only reviewer and validate its structured result."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    REVIEW_SCHEMA_RUNTIME.parent.mkdir(parents=True, exist_ok=True)
+    REVIEW_SCHEMA_RUNTIME.write_text(TRUSTED_REVIEW_SCHEMA, encoding="utf-8")
+    log_file = LOG_DIR / f"review-{issue['number']}-{review_round}.log"
+    review_temp = Path(
+        tempfile.mkdtemp(prefix=f"review-{issue['number']}-{review_round}-", dir=LOG_DIR.resolve())
+    )
+    result_file = review_temp / "result.json"
+    prompt = f"""Review this task branch against origin/main and the issue contract below.
+
+Issue #{issue["number"]}: {issue["title"]}
+
+{issue.get("body") or ""}
+
+Review only for actionable acceptance, correctness, security, race, data-integrity, test, or
+scope defects. Do not report optional style suggestions. Inspect the actual diff and relevant
+repository rules. Return `pass` with zero findings only when no actionable defect remains;
+otherwise return `changes_requested` with precise findings. Do not modify any repository file
+or rerun the full local gate suite; the controller runs those gates separately.
+"""
+    command = (
+        "codex",
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--add-dir",
+        str(review_temp),
+        "--output-schema",
+        str(REVIEW_SCHEMA_RUNTIME),
+        "--output-last-message",
+        str(result_file),
+        "-",
+    )
+    environment = os.environ.copy()
+    environment["TMPDIR"] = str(review_temp)
+    try:
+        return_code, output_tail = run_codex_stream(
+            prompt,
+            log_file,
+            status_context,
+            command=command,
+            state="REVIEWING",
+            env=environment,
+        )
+        if return_code != 0:
+            raise RuntimeError(f"Reviewer exited with {return_code}:\n{output_tail[-3000:]}")
+        return load_review_result(result_file)
+    finally:
+        shutil.rmtree(review_temp, ignore_errors=True)
+
+
+def run_fixer(
+    issue: Issue,
+    findings: list[ReviewFinding],
+    status_context: StatusContext,
+    fix_round: int,
+) -> None:
+    """Apply only validated reviewer findings in the existing task branch."""
+    log_file = LOG_DIR / f"fix-{issue['number']}-{fix_round}.log"
+    prompt = f"""Address validated review findings for issue #{issue["number"]}: {issue["title"]}.
+
+Original issue contract:
+{issue.get("body") or ""}
+
+Validated findings:
+{json.dumps(findings, indent=2)}
+
+Fix every finding completely and minimally. Obey AGENTS.md. Stay within the original issue
+scope. Do not commit, push, merge, deploy, or perform external actions. Leave only justified
+repository changes for the controller to verify.
+"""
+    return_code, output_tail = run_codex_stream(prompt, log_file, status_context, state="FIXING")
+    if return_code != 0:
+        raise RuntimeError(f"Fixer exited with {return_code}:\n{output_tail[-3000:]}")
+    if not run("git", "status", "--porcelain").stdout.strip():
+        raise RuntimeError("Reviewer fixer produced no changes")
+
+
+def commit_review_fix(issue: Issue, fix_round: int) -> None:
+    run("git", "add", "-A")
+    run("git", "commit", "-m", f"codex: address review round {fix_round} for #{issue['number']}")
+    run("git", "push")
+
+
+def mark_pr_review_passed(pr_url: str) -> None:
+    """Add the machine-readable review-passed marker to the draft PR."""
+    run("gh", "pr", "edit", pr_url, "--repo", REPO, "--add-label", REVIEWED_LABEL)
+
+
+def run_review_fix_loop(issue: Issue, status_context: StatusContext) -> ReviewResult:
+    """Review, fix, and reverify with a strict two-fix upper bound."""
+    for review_round in range(1, MAX_FIX_ROUNDS + 2):
+        result = run_reviewer(issue, status_context, review_round)
+        if result["verdict"] == "pass":
+            return result
+        if review_round > MAX_FIX_ROUNDS:
+            raise RuntimeError("Reviewer still found defects after two fix rounds")
+        run_fixer(issue, result["findings"], status_context, review_round)
+        run_verification(issue, status_context, review_round + 1)
+        commit_review_fix(issue, review_round)
+    raise AssertionError("unreachable review loop state")
 
 
 def process_issue(issue: Issue) -> None:
@@ -419,6 +677,8 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
             f"Codex output:\n{output_tail[-3000:]}"
         )
 
+    run_verification(issue, status_context, 1)
+
     write_status(
         "COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context
     )
@@ -453,7 +713,17 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
     write_status(
         "PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context
     )
-    comment(number, f"Codex completed and opened draft PR: {pr_url}")
+    comment(number, f"Codex opened a draft PR for independent review: {pr_url}")
+    run_review_fix_loop(issue, status_context)
+    mark_pr_review_passed(pr_url)
+    write_status(
+        "REVIEW_PASSED",
+        detail="Independent review passed with zero findings",
+        pr_url=pr_url,
+        **status_context,
+    )
+    comment(number, f"Independent review passed with zero findings: {pr_url}")
+    label(number, add=REVIEWED_LABEL)
     label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
 
 
