@@ -74,6 +74,32 @@ class Workspace(UUIDTimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
 
 
+class WorkspaceBusinessProfile(UUIDTimestampMixin, Base):
+    __tablename__ = "workspace_business_profiles"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "tenant_id"],
+            ["workspaces.id", "workspaces.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_workspace_business_profiles_workspace_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "workspace_id",
+            name="uq_workspace_business_profiles_tenant_workspace",
+        ),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    workspace_id: Mapped[UUID] = mapped_column(nullable=False)
+    company_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    business_description: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    products_services: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    target_audience: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    positioning: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    brand_voice: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+
+
 class Membership(UUIDTimestampMixin, Base):
     __tablename__ = "memberships"
     __table_args__ = (

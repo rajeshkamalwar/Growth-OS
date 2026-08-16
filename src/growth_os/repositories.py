@@ -6,7 +6,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from growth_os.db.base import Base
-from growth_os.db.models import Connector, Membership, Site, Tenant, Workspace
+from growth_os.db.models import (
+    Connector,
+    Membership,
+    Site,
+    Tenant,
+    Workspace,
+    WorkspaceBusinessProfile,
+)
 
 TenantOwned = TypeVar("TenantOwned", Workspace, Membership, Site, Connector)
 
@@ -61,6 +68,19 @@ class FoundationRepository:
         )
         total = await self.session.scalar(select(func.count()).select_from(model).where(predicate))
         return items, total or 0
+
+    async def get_business_profile(
+        self, context: TenantContext, workspace_id: UUID
+    ) -> WorkspaceBusinessProfile | None:
+        return cast(
+            WorkspaceBusinessProfile | None,
+            await self.session.scalar(
+                select(WorkspaceBusinessProfile).where(
+                    WorkspaceBusinessProfile.tenant_id == context.tenant_id,
+                    WorkspaceBusinessProfile.workspace_id == workspace_id,
+                )
+            ),
+        )
 
     async def flush(self) -> None:
         await self.session.flush()
