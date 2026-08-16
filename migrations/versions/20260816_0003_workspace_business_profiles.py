@@ -47,16 +47,7 @@ def upgrade() -> None:
             name="uq_workspace_business_profiles_tenant_workspace",
         ),
     )
-    op.create_index(
-        op.f("ix_workspace_business_profiles_tenant_id"),
-        "workspace_business_profiles",
-        ["tenant_id"],
-    )
 
 
 def downgrade() -> None:
-    op.drop_index(
-        op.f("ix_workspace_business_profiles_tenant_id"),
-        table_name="workspace_business_profiles",
-    )
     op.drop_table("workspace_business_profiles")

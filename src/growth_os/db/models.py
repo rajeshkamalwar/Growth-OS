@@ -90,7 +90,7 @@ class WorkspaceBusinessProfile(UUIDTimestampMixin, Base):
         ),
     )
 
-    tenant_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    tenant_id: Mapped[UUID] = mapped_column(nullable=False)
     workspace_id: Mapped[UUID] = mapped_column(nullable=False)
     company_name: Mapped[str] = mapped_column(String(200), nullable=False)
     business_description: Mapped[str | None] = mapped_column(String(4000), nullable=True)
