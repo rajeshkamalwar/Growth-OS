@@ -128,6 +128,21 @@ async def retry_job(
     )
 
 
+async def list_runs(
+    client: AsyncClient,
+    tenant: dict[str, object],
+    job: dict[str, object],
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> Response:
+    return await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}/runs"
+        f"?limit={limit}&offset={offset}",
+        headers=headers(tenant),
+    )
+
+
 async def set_job_and_run_status(
     session_factory: async_sessionmaker[AsyncSession],
     tenant_id: object,
@@ -305,6 +320,170 @@ async def test_job_and_proposal_lists_are_tenant_scoped(client: AsyncClient) -> 
     assert [item["id"] for item in jobs_response.json()["items"]] == [job_a["id"]]
     assert proposals_response.status_code == 200
     assert [item["id"] for item in proposals_response.json()["items"]] == [proposal_a["id"]]
+
+
+async def test_run_history_returns_all_attempts_in_stable_order_and_existing_shape(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Run History")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    assert (await retry_job(client, tenant, job, 1)).status_code == 200
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    assert (await retry_job(client, tenant, job, 2)).status_code == 200
+
+    response = await list_runs(client, tenant, job)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [run["attempt_number"] for run in body["items"]] == [1, 2, 3]
+    assert body["pagination"] == {"limit": 50, "offset": 0, "total": 3}
+    assert set(body["items"][0]) == {
+        "id",
+        "tenant_id",
+        "job_id",
+        "status",
+        "attempt_number",
+        "max_attempts",
+        "retry_delay_seconds",
+        "last_error_code",
+        "created_at",
+        "updated_at",
+    }
+
+
+async def test_run_history_paginates_with_job_specific_total_and_valid_empty_page(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Run Pagination")
+    job = await create_job(client, tenant, workspace, key="paged-job")
+    other_job = await create_job(client, tenant, workspace, key="other-job")
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    assert (await retry_job(client, tenant, job, 1)).status_code == 200
+
+    first_page = await list_runs(client, tenant, job, limit=1, offset=0)
+    second_page = await list_runs(client, tenant, job, limit=1, offset=1)
+    empty_page = await list_runs(client, tenant, job, limit=1, offset=2)
+    one_attempt = await list_runs(client, tenant, other_job)
+
+    assert first_page.json()["pagination"]["total"] == 2
+    assert [run["attempt_number"] for run in first_page.json()["items"]] == [1]
+    assert [run["attempt_number"] for run in second_page.json()["items"]] == [2]
+    assert empty_page.json() == {
+        "items": [],
+        "pagination": {"limit": 1, "offset": 2, "total": 2},
+    }
+    assert len(one_attempt.json()["items"]) == 1
+    assert one_attempt.json()["pagination"]["total"] == 1
+
+
+async def test_run_history_hides_missing_and_cross_tenant_parents_and_isolates_runs(
+    client: AsyncClient,
+) -> None:
+    tenant_a, workspace_a = await setup_tenant(client, "Run Tenant A")
+    tenant_b, workspace_b = await setup_tenant(client, "Run Tenant B")
+    job_a = await create_job(client, tenant_a, workspace_a, key="run-a")
+    other_job_a = await create_job(client, tenant_a, workspace_a, key="other-run-a")
+    job_b = await create_job(client, tenant_b, workspace_b, key="run-b")
+
+    visible = await list_runs(client, tenant_a, job_a)
+    missing = await client.get(
+        f"/api/v1/tenants/{tenant_a['id']}/execution-jobs/{uuid4()}/runs",
+        headers=headers(tenant_a),
+    )
+    cross_tenant = await list_runs(client, tenant_a, job_b)
+
+    assert [run["job_id"] for run in visible.json()["items"]] == [job_a["id"]]
+    assert visible.json()["pagination"]["total"] == 1
+    assert other_job_a["latest_run"]["id"] not in {run["id"] for run in visible.json()["items"]}
+    assert missing.status_code == cross_tenant.status_code == 404
+    assert missing.json()["error"]["code"] == "not_found"
+    assert cross_tenant.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize("query", ["limit=0", "limit=101", "offset=-1"])
+async def test_run_history_reuses_structured_pagination_validation(
+    client: AsyncClient, query: str
+) -> None:
+    tenant, workspace = await setup_tenant(client, f"Invalid run page {query}")
+    job = await create_job(client, tenant, workspace)
+
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}/runs?{query}",
+        headers=headers(tenant),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_run_history_repository_is_deterministic_bounded_and_read_only(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Repository Run History")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    assert (await retry_job(client, tenant, job, 1)).status_code == 200
+    tenant_id = UUID(str(tenant["id"]))
+    job_id = UUID(str(job["id"]))
+
+    async with session_factory() as session:
+        repository = ExecutionRepository(session)
+        before = (
+            await session.scalar(select(func.count()).select_from(ExecutionRun)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+        runs, total = await repository.list_runs(
+            TenantContext(tenant_id=tenant_id), job_id, limit=1, offset=1
+        )
+        after = (
+            await session.scalar(select(func.count()).select_from(ExecutionRun)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+
+    assert total == 2
+    assert [(run.job_id, run.attempt_number) for run in runs] == [(job_id, 2)]
+    assert after == before
+
+
+async def test_run_history_endpoint_has_no_write_or_audit_side_effect(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Read Only Run History")
+    job = await create_job(client, tenant, workspace)
+    job_id = UUID(str(job["id"]))
+    async with session_factory() as session:
+        before_runs = list(
+            (
+                await session.execute(
+                    select(*ExecutionRun.__table__.columns)
+                    .where(ExecutionRun.job_id == job_id)
+                    .order_by(ExecutionRun.attempt_number, ExecutionRun.id)
+                )
+            ).all()
+        )
+        before_audits = await session.scalar(select(func.count()).select_from(AuditEvent))
+
+    response = await list_runs(client, tenant, job)
+
+    async with session_factory() as session:
+        after_runs = list(
+            (
+                await session.execute(
+                    select(*ExecutionRun.__table__.columns)
+                    .where(ExecutionRun.job_id == job_id)
+                    .order_by(ExecutionRun.attempt_number, ExecutionRun.id)
+                )
+            ).all()
+        )
+        after_audits = await session.scalar(select(func.count()).select_from(AuditEvent))
+    assert response.status_code == 200
+    assert after_runs == before_runs
+    assert after_audits == before_audits
 
 
 async def test_approval_is_final_and_records_append_only_decision(client: AsyncClient) -> None:

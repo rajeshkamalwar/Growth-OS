@@ -42,6 +42,15 @@ Tenant-scoped `/api/v1` endpoints create, list, and read execution jobs and acti
 record proposal decisions; transition jobs; and list audit events. Collection responses use
 FOUNDATION-003's bounded `limit`/`offset` pagination and errors retain its structured envelope.
 
+`GET /api/v1/tenants/{tenant_id}/execution-jobs/{job_id}/runs` exposes immutable attempt history
+using the existing execution-run response and collection pagination contracts. The service first
+requires the parent job to exist in the same tenant context, so missing and cross-tenant jobs both
+return `not_found` without revealing run existence. The repository then filters runs by both tenant
+and job identifiers, orders by `attempt_number` ascending with run identifier as a stable
+tie-breaker, and calculates a job-specific total independent of `limit` and `offset`. Valid offsets
+beyond the final attempt return an empty page with the unchanged total. The endpoint is strictly
+read-only and creates no audit event.
+
 `POST /api/v1/tenants/{tenant_id}/execution-jobs/{job_id}/transitions` accepts a strict body:
 
 ```json
@@ -100,9 +109,9 @@ unchanged.
 
 ## Rollback
 
-FOUNDATION-008 and FOUNDATION-009 have no migrations. Revert their respective implementation
-commits to remove the transition or retry endpoint and stop its new audit events. Existing job,
+FOUNDATION-008, FOUNDATION-009, and FOUNDATION-010 have no migrations. Revert their respective
+implementation commits to remove the transition, retry, or run-history endpoint. Existing job,
 run, and audit rows remain valid; successful transitions and retry reservations already committed
-are historical state and are not reversed by the code rollback. The earlier additive migration
-rollback remains available, but dropping those tables would delete control-plane history and
-requires a backup first.
+are historical state and are not reversed by the code rollback. Removing the run-history endpoint
+has no data effect. The earlier additive migration rollback remains available, but dropping those
+tables would delete control-plane history and requires a backup first.
