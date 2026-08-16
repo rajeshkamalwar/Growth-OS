@@ -8,8 +8,8 @@ Safety properties:
 - Runs one task at a time using a lock file.
 - Uses workspace-write for implementation/fixes and read-only for independent review.
 - Runs trusted local verification after implementation and every fix round.
-- Creates a task branch, commits, pushes, and a reviewed draft PR.
-- Never merges or deploys.
+- Creates a task branch, commits, pushes, and a reviewed PR.
+- May squash-merge only when the trusted bounded policy passes; never deploys.
 - Writes runtime status/logs under `.git` so monitoring never dirties the repository.
 """
 
@@ -35,6 +35,8 @@ READY_LABEL = "codex-ready"
 RUNNING_LABEL = "codex-running"
 DONE_LABEL = "codex-pr-open"
 REVIEWED_LABEL = "codex-review-passed"
+MERGED_LABEL = "codex-merged"
+MERGE_BLOCKED_LABEL = "codex-merge-blocked"
 FAILED_LABEL = "codex-failed"
 LOCK_FILE = Path(".git/codex-handoff.lock")
 STATUS_FILE = Path(".git/codex-handoff-status.json")
@@ -49,6 +51,78 @@ MAX_POLL_INTERVAL = 3600
 MAX_FIX_ROUNDS = 2
 MAX_REVIEW_RESULT_BYTES = 65_536
 MAX_REVIEW_FINDINGS = 20
+AUTO_MERGE_FIELDS = {
+    "risk",
+    "roadmap_authorized",
+    "reversible",
+    "production_deployment",
+    "external_customer_side_effect",
+    "stop_categories",
+}
+AUTO_MERGE_SECTION = re.compile(
+    r"^## Auto-merge assessment[ \t]*\n+```json[ \t]*\n(.*?)\n```[ \t]*(?=\n+(?:## |\Z)|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+PROTECTED_AUTO_MERGE_PATHS = {
+    "agents.md",
+    "docs/product.md",
+    "docs/goals.md",
+    "docs/architecture.md",
+    "docs/v1-scope.md",
+}
+PROTECTED_AUTO_MERGE_PARTS = {
+    ".github",
+    "alembic",
+    "auth",
+    "authentication",
+    "authorization",
+    "billing",
+    "credentials",
+    "deploy",
+    "deployment",
+    "infra",
+    "infrastructure",
+    "outreach",
+    "permissions",
+    "secrets",
+    "social",
+    "tenant",
+    "tenants",
+    "terraform",
+    "website",
+}
+PROTECTED_AUTO_MERGE_PREFIXES = (
+    "acl",
+    "auth",
+    "backlink",
+    "bill",
+    "credential",
+    "delete",
+    "deploy",
+    "email",
+    "helm",
+    "identity",
+    "invoice",
+    "k8s",
+    "kubernetes",
+    "mail",
+    "migrat",
+    "oauth",
+    "outreach",
+    "payment",
+    "permission",
+    "production",
+    "publish",
+    "pulumi",
+    "rbac",
+    "secret",
+    "social",
+    "stripe",
+    "tenant",
+    "terraform",
+    "website",
+)
+PROTECTED_AUTO_MERGE_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
 LOCAL_DATABASE_URL = "postgresql+asyncpg://growth_os:growth_os@localhost:5432/growth_os"
 VERIFICATION_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Ruff lint", (".venv/bin/python", "-m", "ruff", "check", ".")),
@@ -82,6 +156,7 @@ class Issue(RequiredIssue, total=False):
     body: str | None
     author: IssueAuthor | None
     url: str
+    state: str
 
 
 class StatusContext(TypedDict):
@@ -103,6 +178,21 @@ class ReviewResult(TypedDict):
     verdict: str
     summary: str
     findings: list[ReviewFinding]
+
+
+class AutoMergeAssessment(TypedDict):
+    risk: str
+    roadmap_authorized: bool
+    reversible: bool
+    production_deployment: bool
+    external_customer_side_effect: bool
+    stop_categories: list[str]
+
+
+class MergeOutcome(TypedDict):
+    merged: bool
+    reasons: list[str]
+    sha: str | None
 
 
 def now_iso() -> str:
@@ -150,6 +240,8 @@ def ensure_labels() -> None:
         RUNNING_LABEL: "Currently running in local Codex controller",
         DONE_LABEL: "Codex opened a draft PR",
         REVIEWED_LABEL: "Independent Codex review passed with zero findings",
+        MERGED_LABEL: "Codex merged an eligible reviewed development PR",
+        MERGE_BLOCKED_LABEL: "Reviewed PR requires a human merge decision",
         FAILED_LABEL: "Codex handoff failed",
     }
     for name, description in labels.items():
@@ -479,6 +571,316 @@ def load_review_result(result_file: Path) -> ReviewResult:
     return {"verdict": verdict, "summary": summary, "findings": validated_findings}
 
 
+def parse_auto_merge_assessment(body: str) -> AutoMergeAssessment:
+    """Parse the single strict owner-authored auto-merge assessment block."""
+    blocks = AUTO_MERGE_SECTION.findall(body)
+    if len(blocks) != 1:
+        raise ValueError("exactly one Auto-merge assessment JSON block is required")
+    try:
+        payload = json.loads(blocks[0])
+    except json.JSONDecodeError as exc:
+        raise ValueError("Auto-merge assessment is not valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != AUTO_MERGE_FIELDS:
+        raise ValueError("Auto-merge assessment fields do not match the contract")
+
+    risk = payload["risk"]
+    roadmap_authorized = payload["roadmap_authorized"]
+    reversible = payload["reversible"]
+    production_deployment = payload["production_deployment"]
+    external_customer_side_effect = payload["external_customer_side_effect"]
+    stop_categories = payload["stop_categories"]
+    if not isinstance(risk, str):
+        raise ValueError("Auto-merge risk must be a string")
+    for name, value in (
+        ("roadmap_authorized", roadmap_authorized),
+        ("reversible", reversible),
+        ("production_deployment", production_deployment),
+        ("external_customer_side_effect", external_customer_side_effect),
+    ):
+        if type(value) is not bool:
+            raise ValueError(f"Auto-merge {name} must be a boolean")
+    if not isinstance(stop_categories, list) or not all(
+        isinstance(category, str) for category in stop_categories
+    ):
+        raise ValueError("Auto-merge stop_categories must be a string list")
+    return {
+        "risk": risk,
+        "roadmap_authorized": roadmap_authorized,
+        "reversible": reversible,
+        "production_deployment": production_deployment,
+        "external_customer_side_effect": external_customer_side_effect,
+        "stop_categories": stop_categories,
+    }
+
+
+def _protected_auto_merge_path(path: str) -> bool:
+    normalized = path.strip().lower()
+    if not normalized or normalized in PROTECTED_AUTO_MERGE_PATHS:
+        return True
+    file_path = Path(normalized)
+    if any(part == "agents.md" for part in file_path.parts):
+        return True
+    if any(part.startswith(".env") for part in file_path.parts) or (
+        file_path.suffix in PROTECTED_AUTO_MERGE_SUFFIXES
+    ):
+        return True
+    path_tokens = [
+        token
+        for part in file_path.parts
+        for token in re.split(r"[^a-z0-9]+", Path(part).stem)
+        if token
+    ]
+    return any(part in PROTECTED_AUTO_MERGE_PARTS for part in file_path.parts) or any(
+        token.startswith(PROTECTED_AUTO_MERGE_PREFIXES) for token in path_tokens
+    )
+
+
+def auto_merge_policy_reasons(issue: Issue, changed_paths: list[str]) -> list[str]:
+    """Return deterministic stop reasons; an empty result authorizes merge evaluation."""
+    reasons: list[str] = []
+    try:
+        assessment = parse_auto_merge_assessment(issue.get("body") or "")
+    except ValueError as exc:
+        return [str(exc)]
+    if assessment["risk"] not in {"low", "medium"}:
+        reasons.append("risk is not low or medium")
+    if not assessment["roadmap_authorized"]:
+        reasons.append("task is not roadmap authorized")
+    if not assessment["reversible"]:
+        reasons.append("change is not declared reversible")
+    if assessment["production_deployment"]:
+        reasons.append("production deployment is declared")
+    if assessment["external_customer_side_effect"]:
+        reasons.append("external customer-facing side effect is declared")
+    if assessment["stop_categories"]:
+        reasons.append("one or more mandatory stop categories are declared")
+    for path in changed_paths:
+        if _protected_auto_merge_path(path):
+            reasons.append(f"protected path requires human merge: {path}")
+    if not changed_paths:
+        reasons.append("no changed paths were found")
+    return reasons
+
+
+def validate_pr_for_merge(
+    metadata: dict[str, object], *, expected_branch: str, reviewed_head: str
+) -> list[str]:
+    """Validate current GitHub PR state against the exact independently reviewed head."""
+    reasons: list[str] = []
+    expected = {
+        "state": "OPEN",
+        "baseRefName": "main",
+        "headRefName": expected_branch,
+        "headRefOid": reviewed_head,
+        "mergeable": "MERGEABLE",
+    }
+    for field, value in expected.items():
+        if metadata.get(field) != value:
+            reasons.append(f"PR {field} does not match required value")
+    if metadata.get("reviewDecision") in {"CHANGES_REQUESTED", "REVIEW_REQUIRED"}:
+        reasons.append("PR has an unsatisfied blocking review state")
+    labels = metadata.get("labels")
+    if not isinstance(labels, list) or REVIEWED_LABEL not in {
+        label.get("name")
+        for label in labels
+        if isinstance(label, dict) and isinstance(label.get("name"), str)
+    }:
+        reasons.append("PR is missing the review-passed marker")
+    if type(metadata.get("number")) is not int:
+        reasons.append("PR number is invalid")
+    return reasons
+
+
+def _pr_metadata(pr_url: str) -> dict[str, object]:
+    payload = json.loads(
+        run(
+            "gh",
+            "pr",
+            "view",
+            pr_url,
+            "--repo",
+            REPO,
+            "--json",
+            "number,url,state,isDraft,mergeable,baseRefName,headRefName,headRefOid,reviewDecision,labels",
+        ).stdout
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub returned invalid PR metadata")
+    return cast(dict[str, object], payload)
+
+
+def _has_unresolved_review_threads(pr_number: int) -> bool:
+    owner, name = REPO.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+        "reviewThreads(first:100){nodes{isResolved}pageInfo{hasNextPage}}}}}"
+    )
+    payload = json.loads(
+        run(
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={pr_number}",
+        ).stdout
+    )
+    try:
+        threads = payload["data"]["repository"]["pullRequest"]["reviewThreads"]
+        nodes = threads["nodes"]
+        has_next_page = threads["pageInfo"]["hasNextPage"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("GitHub returned invalid review-thread metadata") from exc
+    if not isinstance(nodes, list) or type(has_next_page) is not bool:
+        raise RuntimeError("GitHub returned invalid review-thread nodes")
+    return has_next_page or any(
+        not isinstance(node, dict) or node.get("isResolved") is not True for node in nodes
+    )
+
+
+def _current_issue_for_merge(issue_number: int) -> Issue:
+    """Re-fetch and validate the owner-controlled authorization immediately before merge."""
+    payload = json.loads(
+        run(
+            "gh",
+            "issue",
+            "view",
+            str(issue_number),
+            "--repo",
+            REPO,
+            "--json",
+            "number,title,body,author,state,url",
+        ).stdout
+    )
+    if not isinstance(payload, dict) or payload.get("number") != issue_number:
+        raise ValueError("current issue metadata is invalid")
+    author = payload.get("author")
+    login = author.get("login") if isinstance(author, dict) else None
+    if not isinstance(login, str) or login.lower() != OWNER.lower():
+        raise ValueError("current issue author is not authorized")
+    if payload.get("state") != "OPEN":
+        raise ValueError("current issue is no longer open")
+    if not isinstance(payload.get("title"), str) or not isinstance(payload.get("body"), str):
+        raise ValueError("current issue contract is invalid")
+    return cast(Issue, payload)
+
+
+def merge_reviewed_pr(
+    issue: Issue,
+    branch: str,
+    pr_url: str,
+    reviewed_head: str,
+    status_context: StatusContext,
+) -> MergeOutcome:
+    """Apply the trusted policy and exact-head merge, or return a safe blocked outcome."""
+    changed_paths = [
+        path
+        for path in run(
+            "git", "diff", "--no-renames", "--name-only", "-z", "origin/main...HEAD"
+        ).stdout.split("\0")
+        if path
+    ]
+    try:
+        current_issue = _current_issue_for_merge(int(issue["number"]))
+    except ValueError as exc:
+        return {"merged": False, "reasons": [str(exc)], "sha": None}
+    reasons = auto_merge_policy_reasons(current_issue, changed_paths)
+    if reasons:
+        return {"merged": False, "reasons": reasons, "sha": None}
+
+    metadata = _pr_metadata(pr_url)
+    reasons.extend(
+        validate_pr_for_merge(metadata, expected_branch=branch, reviewed_head=reviewed_head)
+    )
+    pr_number = metadata.get("number")
+    if type(pr_number) is int and _has_unresolved_review_threads(pr_number):
+        reasons.append("PR has unresolved review threads")
+    if reasons:
+        return {"merged": False, "reasons": reasons, "sha": None}
+
+    if metadata.get("isDraft") is True:
+        run("gh", "pr", "ready", pr_url, "--repo", REPO)
+
+    try:
+        current_issue = _current_issue_for_merge(int(issue["number"]))
+    except ValueError as exc:
+        return {"merged": False, "reasons": [str(exc)], "sha": None}
+    reasons = auto_merge_policy_reasons(current_issue, changed_paths)
+    metadata = _pr_metadata(pr_url)
+    reasons.extend(
+        validate_pr_for_merge(metadata, expected_branch=branch, reviewed_head=reviewed_head)
+    )
+    if metadata.get("isDraft") is not False:
+        reasons.append("PR is still a draft at final validation")
+    pr_number = metadata.get("number")
+    if type(pr_number) is int and _has_unresolved_review_threads(pr_number):
+        reasons.append("PR has unresolved review threads at final validation")
+    if reasons:
+        return {"merged": False, "reasons": reasons, "sha": None}
+
+    write_status(
+        "MERGING",
+        detail="Auto-merge policy passed; merging exact reviewed head",
+        pr_url=pr_url,
+        **status_context,
+    )
+
+    try:
+        run(
+            "gh",
+            "pr",
+            "merge",
+            pr_url,
+            "--repo",
+            REPO,
+            "--squash",
+            "--match-head-commit",
+            reviewed_head,
+        )
+    except subprocess.CalledProcessError as merge_error:
+        try:
+            merged = _merge_status(pr_url)
+        except (json.JSONDecodeError, subprocess.SubprocessError):
+            raise merge_error from None
+        if merged.get("state") == "OPEN":
+            return {
+                "merged": False,
+                "reasons": ["exact-head merge was rejected while the reviewed PR remains open"],
+                "sha": None,
+            }
+        merge_commit = merged.get("mergeCommit")
+        merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+        if merged.get("state") == "MERGED" and isinstance(merge_sha, str):
+            return {"merged": True, "reasons": [], "sha": merge_sha}
+        raise merge_error from None
+
+    merged = _merge_status(pr_url)
+    merge_commit = merged.get("mergeCommit") if isinstance(merged, dict) else None
+    merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+    if (
+        not isinstance(merged, dict)
+        or merged.get("state") != "MERGED"
+        or not isinstance(merge_sha, str)
+    ):
+        raise RuntimeError("GitHub did not confirm the merged PR and merge commit SHA")
+    return {"merged": True, "reasons": [], "sha": merge_sha}
+
+
+def _merge_status(pr_url: str) -> dict[str, object]:
+    payload = json.loads(
+        run("gh", "pr", "view", pr_url, "--repo", REPO, "--json", "state,mergeCommit,url").stdout
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub returned invalid merge status")
+    return cast(dict[str, object], payload)
+
+
 def run_verification(issue: Issue, status_context: StatusContext, pass_number: int) -> None:
     """Run the trusted, shell-free local quality gate set."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -689,9 +1091,10 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
     run("git", "push", "-u", "origin", branch)
 
     pr_body = (
-        f"Automated local Codex handoff for #{number}.\n\n"
+        f"Automated local Codex handoff for #{number}.\n\nCloses #{number}.\n\n"
         "This PR was created by the self-hosted controller. It is intentionally a draft. "
-        "It must be reviewed before merge. No production deployment is authorized."
+        "It must pass independent review and the bounded merge policy before merge. "
+        "No production deployment is authorized."
     )
     pr_url = run(
         "gh",
@@ -724,6 +1127,30 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
     )
     comment(number, f"Independent review passed with zero findings: {pr_url}")
     label(number, add=REVIEWED_LABEL)
+    reviewed_head = run("git", "rev-parse", "HEAD").stdout.strip()
+    if not reviewed_head:
+        raise RuntimeError("Could not resolve the exact reviewed HEAD commit")
+    outcome = merge_reviewed_pr(issue, branch, pr_url, reviewed_head, status_context)
+    if outcome["merged"]:
+        merge_sha = outcome["sha"]
+        write_status(
+            "MERGED",
+            detail=f"Eligible reviewed PR merged at {merge_sha}",
+            pr_url=pr_url,
+            **status_context,
+        )
+        comment(number, f"Bounded auto-merge completed at `{merge_sha}`: {pr_url}")
+        label(number, add=MERGED_LABEL)
+    else:
+        reason_text = "; ".join(outcome["reasons"])
+        write_status(
+            "MERGE_BLOCKED",
+            detail=reason_text,
+            pr_url=pr_url,
+            **status_context,
+        )
+        comment(number, f"Auto-merge stopped safely; reviewed PR remains open: {reason_text}")
+        label(number, add=MERGE_BLOCKED_LABEL)
     label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
 
 

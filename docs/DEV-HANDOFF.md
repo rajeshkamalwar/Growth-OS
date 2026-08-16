@@ -5,7 +5,7 @@ Remove manual copy/paste between ChatGPT and Codex without depending on paid Git
 
 The flow is:
 
-`Goal -> GitHub issue -> local controller -> implement -> verify -> draft PR -> review/fix loop`
+`Goal -> GitHub issue -> local controller -> implement -> verify -> review/fix -> policy -> merge`
 
 ## One-time prerequisites
 
@@ -23,7 +23,8 @@ The flow is:
 
 The controller uses the repository's existing `AGENTS.md` safety contract. It creates draft
 PRs, runs deterministic local gates, performs an independent read-only review, and may apply up
-to two verified fix rounds. It does not merge or deploy.
+to two verified fix rounds. It may merge only when the strict bounded policy passes. It never
+deploys.
 
 ## Install Codex CLI
 
@@ -90,12 +91,35 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
    committed, pushed to the same draft PR, and reviewed again.
 10. A zero-finding review records `REVIEW_PASSED` and applies `codex-pr-open`. Any invalid output,
     failed gate, no-change fix, or exhausted loop records failure and stops.
-11. Automatic merge remains a separate milestone; this controller stops at the reviewed draft
-    PR.
+11. The controller parses exactly one `## Auto-merge assessment` JSON contract, applies trusted
+    risk and protected-path checks, and validates the current PR, exact reviewed head, blocking
+    reviews, and unresolved threads.
+12. An eligible PR is marked ready and squash-merged with an exact-head guard. An ineligible or
+    ambiguous PR records `MERGE_BLOCKED` and remains open for human handling.
+
+An issue opts into merge evaluation with exactly one assessment block:
+
+````markdown
+## Auto-merge assessment
+
+```json
+{
+  "risk": "low",
+  "roadmap_authorized": true,
+  "reversible": true,
+  "production_deployment": false,
+  "external_customer_side_effect": false,
+  "stop_categories": []
+}
+```
+````
+
+Use `low` or `medium` only. A missing/malformed block or any other value stops merge.
 
 ## Safety rules
 
-- No automatic merge in the current controller.
+- Automatic merge requires an explicit structured low/medium-risk assessment and every D-014
+  and `AGENTS.md` condition to pass.
 - No automatic production deployment.
 - Only issues explicitly labeled `codex-ready` run.
 - Only the configured repository owner's issues are accepted.
@@ -105,6 +129,9 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 - Review runs in a separate read-only Codex process.
 - Reviewer output is size-bounded, schema-constrained, and validated before it reaches a fixer.
 - The fix loop is capped at two rounds and every change must pass the full local gate set.
+- Merge uses no admin, force, or branch-protection bypass flag and is pinned to the reviewed SHA.
+- Missing policy data, protected paths, stale metadata, blocking reviews, or unresolved threads
+  leave the reviewed PR open.
 - `AGENTS.md` remains authoritative.
 - Approval-gated architecture/auth/billing/tenant/destructive changes remain blocked.
 
@@ -113,4 +140,4 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 Press Ctrl-C to stop watch mode. The controller records `STOPPED` status and releases its lock.
 If Codex is actively processing an issue, the interruption is also recorded as an issue failure
 so the queue cannot advance silently. Remove `codex-ready` from queued issues to prevent them
-from starting on the next run. The current controller never merges or deploys.
+from starting on the next run. The controller never deploys.

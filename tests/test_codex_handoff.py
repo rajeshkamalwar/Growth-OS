@@ -218,6 +218,526 @@ def finding(title: str = "Fix the defect") -> dict[str, object]:
     }
 
 
+def auto_merge_body(**overrides: object) -> str:
+    assessment: dict[str, object] = {
+        "risk": "low",
+        "roadmap_authorized": True,
+        "reversible": True,
+        "production_deployment": False,
+        "external_customer_side_effect": False,
+        "stop_categories": [],
+    }
+    assessment.update(overrides)
+    return (
+        "## Goal\n\nImplement bounded work.\n\n"
+        "## Auto-merge assessment\n\n```json\n"
+        f"{json.dumps(assessment)}\n"
+        "```\n"
+    )
+
+
+def test_parse_auto_merge_assessment_accepts_exact_contract() -> None:
+    assessment = codex_handoff.parse_auto_merge_assessment(auto_merge_body(risk="medium"))
+
+    assert assessment["risk"] == "medium"
+    assert assessment["roadmap_authorized"] is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "No assessment",
+        auto_merge_body() + auto_merge_body(),
+        auto_merge_body(unknown=True),
+        auto_merge_body(risk="high"),
+        auto_merge_body(roadmap_authorized=False),
+        auto_merge_body(reversible=False),
+        auto_merge_body(production_deployment=True),
+        auto_merge_body(external_customer_side_effect=True),
+        auto_merge_body(stop_categories=["billing"]),
+    ],
+)
+def test_auto_merge_policy_blocks_invalid_or_ineligible_assessment(body: str) -> None:
+    reasons = codex_handoff.auto_merge_policy_reasons(
+        {"number": 18, "title": "Task", "body": body},
+        ["devtools/codex_handoff.py", "tests/test_codex_handoff.py"],
+    )
+
+    assert reasons
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "AGENTS.md",
+        "src/growth_os/AGENTS.md",
+        ".github/workflows/deploy.yml",
+        "alembic/versions/999_destructive.py",
+        "src/growth_os/auth/service.py",
+        "src/growth_os/billing.py",
+        "infra/production.tf",
+        "website/index.html",
+        ".env.production",
+        "config/.env.production",
+        "src/growth_os/authz.py",
+        "db/migrations/999_drop.py",
+        "k8s/api.yaml",
+        "scripts/publish.py",
+        "email/outreach_service.py",
+    ],
+)
+def test_auto_merge_policy_blocks_protected_paths(path: str) -> None:
+    reasons = codex_handoff.auto_merge_policy_reasons(
+        {"number": 18, "title": "Task", "body": auto_merge_body()},
+        [path],
+    )
+
+    assert any("path" in reason.lower() for reason in reasons)
+
+
+def test_auto_merge_policy_allows_bounded_development_paths() -> None:
+    reasons = codex_handoff.auto_merge_policy_reasons(
+        {"number": 18, "title": "Task", "body": auto_merge_body(risk="medium")},
+        [
+            "devtools/codex_handoff.py",
+            "tests/test_codex_handoff.py",
+            "docs/CURRENT-TASK.md",
+            "docs/DECISIONS.md",
+            "docs/DEV-HANDOFF.md",
+        ],
+    )
+
+    assert reasons == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("state", "CLOSED"),
+        ("baseRefName", "release"),
+        ("headRefName", "codex/other"),
+        ("headRefOid", "different"),
+        ("mergeable", "CONFLICTING"),
+        ("reviewDecision", "CHANGES_REQUESTED"),
+        ("reviewDecision", "REVIEW_REQUIRED"),
+    ],
+)
+def test_validate_pr_for_merge_rejects_stale_or_blocking_metadata(
+    field: str, value: object
+) -> None:
+    metadata: dict[str, object] = {
+        "number": 19,
+        "url": "https://github.com/example/repo/pull/19",
+        "state": "OPEN",
+        "isDraft": True,
+        "mergeable": "MERGEABLE",
+        "baseRefName": "main",
+        "headRefName": "codex/task",
+        "headRefOid": "reviewed-sha",
+        "reviewDecision": None,
+        "labels": [{"name": "codex-review-passed"}],
+    }
+    metadata[field] = value
+
+    reasons = codex_handoff.validate_pr_for_merge(
+        metadata, expected_branch="codex/task", reviewed_head="reviewed-sha"
+    )
+
+    assert reasons
+
+
+def test_validate_pr_for_merge_accepts_exact_reviewed_head() -> None:
+    metadata: dict[str, object] = {
+        "number": 19,
+        "url": "https://github.com/example/repo/pull/19",
+        "state": "OPEN",
+        "isDraft": True,
+        "mergeable": "MERGEABLE",
+        "baseRefName": "main",
+        "headRefName": "codex/task",
+        "headRefOid": "reviewed-sha",
+        "reviewDecision": None,
+        "labels": [{"name": "codex-review-passed"}],
+    }
+
+    assert (
+        codex_handoff.validate_pr_for_merge(
+            metadata, expected_branch="codex/task", reviewed_head="reviewed-sha"
+        )
+        == []
+    )
+
+
+def test_unresolved_review_threads_block_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "nodes": [{"isResolved": True}, {"isResolved": False}],
+                        "pageInfo": {"hasNextPage": False},
+                    }
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    assert codex_handoff._has_unresolved_review_threads(19) is True
+
+
+def test_malformed_review_thread_metadata_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, stdout="{}", stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="review-thread metadata"):
+        codex_handoff._has_unresolved_review_threads(19)
+
+
+def test_paginated_review_threads_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "nodes": [{"isResolved": True}],
+                        "pageInfo": {"hasNextPage": True},
+                    }
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    assert codex_handoff._has_unresolved_review_threads(19) is True
+
+
+def test_merge_reviewed_pr_blocks_without_calling_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        if args == ("git", "diff", "--no-renames", "--name-only", "-z", "origin/main...HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="AGENTS.md\0", stderr="")
+        if args[:3] == ("gh", "issue", "view"):
+            payload = {
+                "number": 18,
+                "title": "Task",
+                "body": auto_merge_body(),
+                "author": {"login": codex_handoff.OWNER},
+                "state": "OPEN",
+                "url": "https://github.com/example/repo/issues/18",
+            }
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    outcome = codex_handoff.merge_reviewed_pr(
+        {"number": 18, "title": "Task", "body": auto_merge_body()},
+        "codex/task",
+        "https://github.com/example/repo/pull/19",
+        "reviewed-sha",
+        {"issue": 18, "title": "Task", "branch": "codex/task", "started_at": "now"},
+    )
+
+    assert outcome["merged"] is False
+    assert (
+        "git",
+        "diff",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        "origin/main...HEAD",
+    ) in commands
+    assert not any(command[:3] == ("gh", "pr", "merge") for command in commands)
+
+
+def test_merge_reviewed_pr_uses_exact_head_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+    ready = False
+    metadata = {
+        "number": 19,
+        "url": "https://github.com/example/repo/pull/19",
+        "state": "OPEN",
+        "isDraft": True,
+        "mergeable": "MERGEABLE",
+        "baseRefName": "main",
+        "headRefName": "codex/task",
+        "headRefOid": "reviewed-sha",
+        "reviewDecision": None,
+        "labels": [{"name": "codex-review-passed"}],
+    }
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal ready
+        commands.append(args)
+        if args == ("git", "diff", "--no-renames", "--name-only", "-z", "origin/main...HEAD"):
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="devtools/codex_handoff.py\0tests/test_codex_handoff.py\0",
+                stderr="",
+            )
+        if args[:3] == ("gh", "issue", "view"):
+            payload = {
+                "number": 18,
+                "title": "Task",
+                "body": auto_merge_body(risk="medium"),
+                "author": {"login": codex_handoff.OWNER},
+                "state": "OPEN",
+                "url": "https://github.com/example/repo/issues/18",
+            }
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        if args[:3] == ("gh", "pr", "view"):
+            if args[-1] == "state,mergeCommit,url":
+                payload = {
+                    "state": "MERGED",
+                    "mergeCommit": {"oid": "merge-sha"},
+                    "url": metadata["url"],
+                }
+            else:
+                payload = {**metadata, "isDraft": not ready}
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        if args[:3] == ("gh", "api", "graphql"):
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequest": {
+                                    "reviewThreads": {
+                                        "nodes": [],
+                                        "pageInfo": {"hasNextPage": False},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if args[:3] == ("gh", "pr", "merge"):
+            return subprocess.CompletedProcess(args, 0, stdout="merged", stderr="")
+        if args[:3] == ("gh", "pr", "ready"):
+            ready = True
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    monkeypatch.setattr(codex_handoff, "write_status", lambda *_args, **_kwargs: None)
+
+    outcome = codex_handoff.merge_reviewed_pr(
+        {"number": 18, "title": "Task", "body": auto_merge_body(risk="medium")},
+        "codex/task",
+        "https://github.com/example/repo/pull/19",
+        "reviewed-sha",
+        {"issue": 18, "title": "Task", "branch": "codex/task", "started_at": "now"},
+    )
+
+    merge_command = next(command for command in commands if command[:3] == ("gh", "pr", "merge"))
+    assert outcome["merged"] is True
+    assert "--squash" in merge_command
+    assert merge_command[merge_command.index("--match-head-commit") + 1] == "reviewed-sha"
+    assert "--admin" not in merge_command
+    assert "--force" not in merge_command
+
+
+def test_merge_reviewed_pr_uses_fresh_issue_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        if args == ("git", "diff", "--no-renames", "--name-only", "-z", "origin/main...HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="devtools/tool.py\0", stderr="")
+        if args[:3] == ("gh", "issue", "view"):
+            payload = {
+                "number": 18,
+                "title": "Task",
+                "body": "Authorization removed",
+                "author": {"login": codex_handoff.OWNER},
+                "state": "OPEN",
+                "url": "https://github.com/example/repo/issues/18",
+            }
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    outcome = codex_handoff.merge_reviewed_pr(
+        {"number": 18, "title": "Task", "body": auto_merge_body()},
+        "codex/task",
+        "https://github.com/example/repo/pull/19",
+        "reviewed-sha",
+        {"issue": 18, "title": "Task", "branch": "codex/task", "started_at": "now"},
+    )
+
+    assert outcome["merged"] is False
+    assert not any(command[:3] == ("gh", "pr", "merge") for command in commands)
+
+
+def test_merge_reviewed_pr_blocks_review_race_after_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = False
+    thread_checks = 0
+    commands: list[tuple[str, ...]] = []
+    metadata = {
+        "number": 19,
+        "url": "https://github.com/example/repo/pull/19",
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "baseRefName": "main",
+        "headRefName": "codex/task",
+        "headRefOid": "reviewed-sha",
+        "reviewDecision": None,
+        "labels": [{"name": "codex-review-passed"}],
+    }
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal ready, thread_checks
+        commands.append(args)
+        if args == ("git", "diff", "--no-renames", "--name-only", "-z", "origin/main...HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="devtools/tool.py\0", stderr="")
+        if args[:3] == ("gh", "issue", "view"):
+            payload = {
+                "number": 18,
+                "title": "Task",
+                "body": auto_merge_body(),
+                "author": {"login": codex_handoff.OWNER},
+                "state": "OPEN",
+                "url": "https://github.com/example/repo/issues/18",
+            }
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        if args[:3] == ("gh", "pr", "view"):
+            return subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps({**metadata, "isDraft": not ready}), stderr=""
+            )
+        if args[:3] == ("gh", "api", "graphql"):
+            thread_checks += 1
+            payload = {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [{"isResolved": thread_checks == 1}],
+                                "pageInfo": {"hasNextPage": False},
+                            }
+                        }
+                    }
+                }
+            }
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        if args[:3] == ("gh", "pr", "ready"):
+            ready = True
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    outcome = codex_handoff.merge_reviewed_pr(
+        {"number": 18, "title": "Task", "body": auto_merge_body()},
+        "codex/task",
+        "https://github.com/example/repo/pull/19",
+        "reviewed-sha",
+        {"issue": 18, "title": "Task", "branch": "codex/task", "started_at": "now"},
+    )
+
+    assert outcome["merged"] is False
+    assert any("final validation" in reason for reason in outcome["reasons"])
+    assert not any(command[:3] == ("gh", "pr", "merge") for command in commands)
+
+
+def test_merge_rejection_for_open_pr_is_policy_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+    metadata = {
+        "number": 19,
+        "url": "https://github.com/example/repo/pull/19",
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "baseRefName": "main",
+        "headRefName": "codex/task",
+        "headRefOid": "reviewed-sha",
+        "reviewDecision": None,
+        "labels": [{"name": "codex-review-passed"}],
+    }
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        if args == ("git", "diff", "--no-renames", "--name-only", "-z", "origin/main...HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="devtools/tool.py\0", stderr="")
+        if args[:3] == ("gh", "issue", "view"):
+            payload = {
+                "number": 18,
+                "title": "Task",
+                "body": auto_merge_body(),
+                "author": {"login": codex_handoff.OWNER},
+                "state": "OPEN",
+                "url": "https://github.com/example/repo/issues/18",
+            }
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        if args[:3] == ("gh", "api", "graphql"):
+            payload = {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [],
+                                "pageInfo": {"hasNextPage": False},
+                            }
+                        }
+                    }
+                }
+            }
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        if args[:3] == ("gh", "pr", "merge"):
+            raise subprocess.CalledProcessError(1, args, stderr="head changed")
+        if args[:3] == ("gh", "pr", "view") and args[-1] == "state,mergeCommit,url":
+            payload = {"state": "OPEN", "mergeCommit": None, "url": metadata["url"]}
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+        if args[:3] == ("gh", "pr", "view"):
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(metadata), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    monkeypatch.setattr(codex_handoff, "write_status", lambda *_args, **_kwargs: None)
+
+    outcome = codex_handoff.merge_reviewed_pr(
+        {"number": 18, "title": "Task", "body": auto_merge_body()},
+        "codex/task",
+        "https://github.com/example/repo/pull/19",
+        "reviewed-sha",
+        {"issue": 18, "title": "Task", "branch": "codex/task", "started_at": "now"},
+    )
+
+    assert outcome["merged"] is False
+    assert any("rejected" in reason for reason in outcome["reasons"])
+
+
 def test_load_review_result_accepts_clean_pass(tmp_path: Path) -> None:
     result_file = tmp_path / "review.json"
     result_file.write_text(json.dumps(review_result(verdict="pass", findings=[])), encoding="utf-8")
@@ -508,6 +1028,20 @@ def test_process_issue_verifies_before_pr_then_completes_independent_review(
     )
     monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
     monkeypatch.setattr(codex_handoff, "write_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "merge_reviewed_pr",
+        lambda *_args: {"merged": False, "reasons": ["human merge"], "sha": None},
+    )
+
+    original_run = codex_handoff.run
+
+    def run_with_head(*args: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="reviewed-sha\n", stderr="")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(codex_handoff, "run", run_with_head)
 
     codex_handoff.process_issue({"number": 16, "title": "Task", "body": "Contract"})
 
