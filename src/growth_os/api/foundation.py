@@ -126,7 +126,7 @@ def create_foundation_router(
         context: Context,
         session: Session,
     ) -> object:
-        values = payload.model_dump(exclude={"actor_id"}, exclude_none=True)
+        values = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
         return await service(session).create_business_profile(
             context, workspace_id, values=values, actor_id=payload.actor_id
         )

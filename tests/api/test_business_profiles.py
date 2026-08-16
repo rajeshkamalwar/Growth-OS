@@ -141,6 +141,30 @@ async def test_profile_lifecycle_is_partial_stable_and_audited(
     assert "Confidential" not in str([event.details for event in events])
 
 
+async def test_create_audit_includes_explicitly_null_profile_fields(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_id, workspace_id = await setup_workspace(client)
+
+    response = await client.post(
+        profile_url(tenant_id, workspace_id),
+        headers=headers(tenant_id),
+        json={"company_name": "Acme", "business_description": None},
+    )
+
+    assert response.status_code == 201
+    async with session_factory() as session:
+        audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.event_type == "workspace_business_profile.created")
+        )
+    assert audit is not None
+    assert audit.details == {
+        "workspace_id": workspace_id,
+        "changed_fields": ["business_description", "company_name"],
+    }
+
+
 @pytest.mark.parametrize(
     "payload",
     [
