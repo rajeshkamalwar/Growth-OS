@@ -40,6 +40,14 @@ remaining bounded narrative fields may be supplied incrementally. Profile text i
 operational context rather than measured evidence. Successful create and update operations add
 redacted audit events containing only the workspace ID and changed field names.
 
+Each workspace may also store one durable primary growth goal at
+`/api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/primary-growth-goal`. Use `POST` to create,
+`GET` to retrieve, and `PATCH` to update one or more supplied fields. `objective` is required and
+the optional `success_definition` and ISO calendar `target_date` may be explicitly cleared with
+`null`. Goal text and dates record supplied intent only; they are not measured evidence, progress,
+attainment, attribution, or proof of business performance. Successful mutations add one redacted
+audit event containing only the workspace ID and alphabetically sorted supplied field names.
+
 Run the complete local verification suite with:
 
 ```bash
@@ -58,3 +66,10 @@ business-profile data. Downgrading PRODUCT-001 drops `workspace_business_profile
 records; run that downgrade only in a disposable development database. Any downgrade against
 meaningful shared or production data requires explicit approval, a verified backup, and a tested
 recovery plan first.
+
+For PRODUCT-002, reverting the application code while retaining the additive
+`workspace_primary_growth_goals` table is likewise the preferred rollback because it stops new
+goal operations without deleting stored intent. The PRODUCT-002 downgrade drops only that table
+and permanently deletes its goal records, so it is limited to disposable development databases.
+Before any approved downgrade against meaningful shared or production data, obtain explicit
+approval, take and verify a backup, and document and test recovery.

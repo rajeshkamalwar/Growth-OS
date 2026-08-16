@@ -1,8 +1,8 @@
-from datetime import datetime
-from typing import TypeVar
+from datetime import date, datetime
+from typing import Annotated, TypeVar
 from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from growth_os.db.models import (
     ApprovalDecisionValue,
@@ -14,6 +14,23 @@ from growth_os.db.models import (
 from growth_os.execution import ExecutionStatus
 
 T = TypeVar("T")
+
+
+def strict_iso_date(value: object) -> date:
+    if type(value) is date:
+        return value
+    if not isinstance(value, str):
+        raise ValueError("Date must use YYYY-MM-DD format")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("Date must use YYYY-MM-DD format") from error
+    if parsed.isoformat() != value:
+        raise ValueError("Date must use YYYY-MM-DD format")
+    return parsed
+
+
+StrictISODate = Annotated[date, BeforeValidator(strict_iso_date)]
 
 
 class StrictInput(BaseModel):
@@ -102,6 +119,37 @@ class BusinessProfileResponse(AuditFields):
     target_audience: str | None
     positioning: str | None
     brand_voice: str | None
+
+
+class PrimaryGrowthGoalCreate(StrictInput):
+    objective: str = Field(min_length=1, max_length=2000)
+    success_definition: str | None = Field(default=None, min_length=1, max_length=2000)
+    target_date: StrictISODate | None = None
+    actor_id: UUID | None = None
+
+
+class PrimaryGrowthGoalUpdate(StrictInput):
+    objective: str | None = Field(default=None, min_length=1, max_length=2000)
+    success_definition: str | None = Field(default=None, min_length=1, max_length=2000)
+    target_date: StrictISODate | None = None
+    actor_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def includes_goal_change(self) -> "PrimaryGrowthGoalUpdate":
+        supplied = self.model_fields_set - {"actor_id"}
+        if not supplied:
+            raise ValueError("At least one goal field must be updated")
+        if "objective" in supplied and self.objective is None:
+            raise ValueError("Objective cannot be cleared")
+        return self
+
+
+class PrimaryGrowthGoalResponse(AuditFields):
+    tenant_id: UUID
+    workspace_id: UUID
+    objective: str
+    success_definition: str | None
+    target_date: date | None
 
 
 class MembershipCreate(StrictInput):
