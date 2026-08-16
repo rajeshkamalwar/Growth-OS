@@ -100,6 +100,24 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
     ) -> ExecutionJobResponse:
         return job_response(await service(session).get_job(context, resource_id))
 
+    @router.get(
+        "/tenants/{tenant_id}/execution-jobs/{resource_id}/runs",
+        response_model=Page[ExecutionRunResponse],
+    )
+    async def list_runs(
+        resource_id: UUID,
+        context: Context,
+        session: Session,
+        limit: Limit = 50,
+        offset: Offset = 0,
+    ) -> Page[ExecutionRunResponse]:
+        runs, total = await service(session).list_runs(
+            context, resource_id, limit=limit, offset=offset
+        )
+        return page(
+            [ExecutionRunResponse.model_validate(run) for run in runs], total, limit, offset
+        )
+
     @router.post(
         "/tenants/{tenant_id}/execution-jobs/{resource_id}/transitions",
         response_model=ExecutionJobResponse,

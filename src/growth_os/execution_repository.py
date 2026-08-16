@@ -137,6 +137,34 @@ class ExecutionRepository:
             latest_by_job.setdefault(run.job_id, run)
         return [(job, latest_by_job.get(job.id)) for job in jobs], total
 
+    async def list_runs(
+        self,
+        context: TenantContext,
+        job_id: UUID,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[ExecutionRun], int]:
+        predicate = (
+            ExecutionRun.tenant_id == context.tenant_id,
+            ExecutionRun.job_id == job_id,
+        )
+        runs = list(
+            (
+                await self.session.scalars(
+                    select(ExecutionRun)
+                    .where(*predicate)
+                    .order_by(ExecutionRun.attempt_number, ExecutionRun.id)
+                    .limit(limit)
+                    .offset(offset)
+                )
+            ).all()
+        )
+        total = await self.session.scalar(
+            select(func.count()).select_from(ExecutionRun).where(*predicate)
+        )
+        return runs, total or 0
+
     async def list_owned(
         self,
         model: type[ExecutionOwned],

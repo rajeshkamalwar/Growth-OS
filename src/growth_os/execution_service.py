@@ -221,6 +221,12 @@ class ExecutionService:
             results.append(JobResult(job, run, False))
         return results, total
 
+    async def list_runs(
+        self, context: TenantContext, job_id: UUID, *, limit: int, offset: int
+    ) -> tuple[list[ExecutionRun], int]:
+        await self.get_owned(ExecutionJob, context, job_id)
+        return await self.repository.list_runs(context, job_id, limit=limit, offset=offset)
+
     async def create_proposal(
         self,
         context: TenantContext,
