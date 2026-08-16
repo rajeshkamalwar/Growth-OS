@@ -48,4 +48,11 @@ production deployment authorization.
 ## D-015 — The local controller may persistently poll
 The development handoff controller may run a bounded polling loop with one live instance,
 recover stale locks, stop cleanly, and fail closed on task errors. Operating-system service
-installation and automated reviewer/fix/merge behavior are separate milestones.
+installation and automatic merge behavior are separate milestones.
+
+## D-016 — Development review is independent, structured, and bounded
+After implementation, the local controller runs deterministic repository gates and a fresh
+read-only Codex review whose schema-constrained output is treated as untrusted and validated.
+Actionable findings may trigger at most two workspace-write fix rounds, each fully reverified.
+The controller fails closed on malformed output, failed gates, no-change fixes, or exhausted
+rounds, and still stops at a draft PR; automatic merge remains a separate milestone.
