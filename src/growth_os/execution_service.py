@@ -44,15 +44,14 @@ class ExecutionService:
     ) -> JobResult:
         existing = await self.repository.get_job_by_idempotency_key(context, idempotency_key)
         if existing is not None:
-            run = await self._required_run(context, existing.id)
-            if (
-                existing.workspace_id != workspace_id
-                or existing.kind != kind
-                or run.max_attempts != max_attempts
-                or run.retry_delay_seconds != retry_delay_seconds
-            ):
-                raise ConflictError
-            return JobResult(existing, run, False)
+            return await self._idempotent_job_result(
+                context,
+                existing,
+                workspace_id=workspace_id,
+                kind=kind,
+                max_attempts=max_attempts,
+                retry_delay_seconds=retry_delay_seconds,
+            )
 
         foundation = FoundationService(FoundationRepository(self.repository.session))
         await foundation.get_owned(Workspace, context, workspace_id)
@@ -73,7 +72,21 @@ class ExecutionService:
         )
         audit = self._audit(context, "execution_job.created", "execution_job", job.id)
         self.repository.add_all(job, run, audit)
-        await self._commit()
+        try:
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            winner = await self.repository.get_job_by_idempotency_key(context, idempotency_key)
+            if winner is None:
+                raise ConflictError from error
+            return await self._idempotent_job_result(
+                context,
+                winner,
+                workspace_id=workspace_id,
+                kind=kind,
+                max_attempts=max_attempts,
+                retry_delay_seconds=retry_delay_seconds,
+            )
         await self.repository.refresh(job)
         await self.repository.refresh(run)
         return JobResult(job, run, True)
@@ -82,6 +95,19 @@ class ExecutionService:
         job = await self.get_owned(ExecutionJob, context, job_id)
         run = await self._required_run(context, job.id)
         return JobResult(job, run, False)
+
+    async def list_jobs(
+        self, context: TenantContext, *, limit: int, offset: int
+    ) -> tuple[list[JobResult], int]:
+        page, total = await self.repository.list_jobs_with_latest_runs(
+            context, limit=limit, offset=offset
+        )
+        results: list[JobResult] = []
+        for job, run in page:
+            if run is None:
+                raise NotFoundError
+            results.append(JobResult(job, run, False))
+        return results, total
 
     async def create_proposal(
         self,
@@ -160,6 +186,26 @@ class ExecutionService:
         if run is None:
             raise NotFoundError
         return run
+
+    async def _idempotent_job_result(
+        self,
+        context: TenantContext,
+        job: ExecutionJob,
+        *,
+        workspace_id: UUID,
+        kind: str,
+        max_attempts: int,
+        retry_delay_seconds: int,
+    ) -> JobResult:
+        run = await self._required_run(context, job.id)
+        if (
+            job.workspace_id != workspace_id
+            or job.kind != kind
+            or run.max_attempts != max_attempts
+            or run.retry_delay_seconds != retry_delay_seconds
+        ):
+            raise ConflictError
+        return JobResult(job, run, False)
 
     async def _commit(self, *, invalid_transition: bool = False) -> None:
         try:

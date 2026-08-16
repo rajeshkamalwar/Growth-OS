@@ -18,7 +18,7 @@ from growth_os.api.schemas import (
     Page,
     Pagination,
 )
-from growth_os.db.models import ActionProposal, ExecutionJob
+from growth_os.db.models import ActionProposal
 from growth_os.execution_repository import ExecutionRepository
 from growth_os.execution_service import ExecutionService, JobResult
 from growth_os.repositories import TenantContext
@@ -86,11 +86,7 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
     async def list_jobs(
         context: Context, session: Session, limit: Limit = 50, offset: Offset = 0
     ) -> Page[ExecutionJobResponse]:
-        execution_service = service(session)
-        jobs, total = await execution_service.repository.list_owned(
-            ExecutionJob, context, limit=limit, offset=offset
-        )
-        results = [await execution_service.get_job(context, job.id) for job in jobs]
+        results, total = await service(session).list_jobs(context, limit=limit, offset=offset)
         return page([job_response(result) for result in results], total, limit, offset)
 
     @router.get(

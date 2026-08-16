@@ -142,6 +142,10 @@ def upgrade() -> None:
         ),
         sa.Column("id", sa.Uuid(), nullable=False),
         *timestamp_columns(),
+        sa.CheckConstraint(
+            "risk_level != 'HIGH' OR requires_approval",
+            name="ck_action_proposals_high_risk_requires_approval",
+        ),
         sa.ForeignKeyConstraint(
             ["job_id", "tenant_id"],
             ["execution_jobs.id", "execution_jobs.tenant_id"],

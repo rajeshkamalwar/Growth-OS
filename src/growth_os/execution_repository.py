@@ -55,6 +55,30 @@ class ExecutionRepository:
             ),
         )
 
+    async def list_jobs_with_latest_runs(
+        self,
+        context: TenantContext,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[tuple[ExecutionJob, ExecutionRun | None]], int]:
+        jobs, total = await self.list_owned(ExecutionJob, context, limit=limit, offset=offset)
+        if not jobs:
+            return [], total
+
+        runs = await self.session.scalars(
+            select(ExecutionRun)
+            .where(
+                ExecutionRun.tenant_id == context.tenant_id,
+                ExecutionRun.job_id.in_([job.id for job in jobs]),
+            )
+            .order_by(ExecutionRun.job_id, ExecutionRun.attempt_number.desc())
+        )
+        latest_by_job: dict[UUID, ExecutionRun] = {}
+        for run in runs:
+            latest_by_job.setdefault(run.job_id, run)
+        return [(job, latest_by_job.get(job.id)) for job in jobs], total
+
     async def list_owned(
         self,
         model: type[ExecutionOwned],

@@ -227,6 +227,10 @@ class ActionProposal(UUIDTimestampMixin, Base):
             name="fk_action_proposals_job_tenant",
         ),
         UniqueConstraint("id", "tenant_id", name="uq_action_proposals_id_tenant_id"),
+        CheckConstraint(
+            "risk_level != 'HIGH' OR requires_approval",
+            name="high_risk_requires_approval",
+        ),
     )
 
     tenant_id: Mapped[UUID] = mapped_column(nullable=False, index=True)

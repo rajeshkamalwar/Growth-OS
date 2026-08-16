@@ -7,7 +7,10 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from growth_os.db.base import Base
+from growth_os.db.models import ExecutionJob
+from growth_os.execution_repository import ExecutionRepository
 from growth_os.main import create_app
+from growth_os.repositories import TenantContext
 
 
 @pytest.fixture
@@ -134,6 +137,46 @@ async def test_idempotency_key_reuse_with_different_request_conflicts(client: As
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "conflict"
+
+
+async def test_identical_request_recovers_when_idempotency_insert_loses_race(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Tenant A")
+    first = await create_job(client, tenant, workspace)
+    original_lookup = ExecutionRepository.get_job_by_idempotency_key
+    stale_read = True
+
+    async def miss_once_then_read_winner(
+        repository: ExecutionRepository,
+        context: TenantContext,
+        idempotency_key: str,
+    ) -> ExecutionJob | None:
+        nonlocal stale_read
+        if stale_read:
+            stale_read = False
+            return None
+        return await original_lookup(repository, context, idempotency_key)
+
+    monkeypatch.setattr(
+        ExecutionRepository,
+        "get_job_by_idempotency_key",
+        miss_once_then_read_winner,
+    )
+
+    response = await client.post(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs",
+        headers=headers(tenant),
+        json={
+            "workspace_id": workspace["id"],
+            "kind": "site_analysis",
+            "idempotency_key": "crawl-homepage-1",
+            "max_attempts": 3,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == first["id"]
 
 
 async def test_same_idempotency_key_is_isolated_by_tenant(client: AsyncClient) -> None:
