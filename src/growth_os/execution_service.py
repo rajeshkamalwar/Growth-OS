@@ -209,10 +209,25 @@ class ExecutionService:
         return JobResult(job, new_run, False)
 
     async def list_jobs(
-        self, context: TenantContext, *, limit: int, offset: int
+        self,
+        context: TenantContext,
+        *,
+        workspace_id: UUID | None = None,
+        status: ExecutionStatus | None = None,
+        kind: str | None = None,
+        limit: int,
+        offset: int,
     ) -> tuple[list[JobResult], int]:
+        if workspace_id is not None:
+            foundation = FoundationService(FoundationRepository(self.repository.session))
+            await foundation.get_owned(Workspace, context, workspace_id)
         page, total = await self.repository.list_jobs_with_latest_runs(
-            context, limit=limit, offset=offset
+            context,
+            workspace_id=workspace_id,
+            status=status,
+            kind=kind,
+            limit=limit,
+            offset=offset,
         )
         results: list[JobResult] = []
         for job, run in page:

@@ -117,12 +117,35 @@ class ExecutionRepository:
         self,
         context: TenantContext,
         *,
+        workspace_id: UUID | None = None,
+        status: ExecutionStatus | None = None,
+        kind: str | None = None,
         limit: int,
         offset: int,
     ) -> tuple[list[tuple[ExecutionJob, ExecutionRun | None]], int]:
-        jobs, total = await self.list_owned(ExecutionJob, context, limit=limit, offset=offset)
+        predicate = [ExecutionJob.tenant_id == context.tenant_id]
+        if workspace_id is not None:
+            predicate.append(ExecutionJob.workspace_id == workspace_id)
+        if status is not None:
+            predicate.append(ExecutionJob.status == status)
+        if kind is not None:
+            predicate.append(ExecutionJob.kind == kind)
+        jobs = list(
+            (
+                await self.session.scalars(
+                    select(ExecutionJob)
+                    .where(*predicate)
+                    .order_by(ExecutionJob.created_at, ExecutionJob.id)
+                    .limit(limit)
+                    .offset(offset)
+                )
+            ).all()
+        )
+        total = await self.session.scalar(
+            select(func.count()).select_from(ExecutionJob).where(*predicate)
+        )
         if not jobs:
-            return [], total
+            return [], total or 0
 
         runs = await self.session.scalars(
             select(ExecutionRun)
@@ -135,7 +158,7 @@ class ExecutionRepository:
         latest_by_job: dict[UUID, ExecutionRun] = {}
         for run in runs:
             latest_by_job.setdefault(run.job_id, run)
-        return [(job, latest_by_job.get(job.id)) for job in jobs], total
+        return [(job, latest_by_job.get(job.id)) for job in jobs], total or 0
 
     async def list_runs(
         self,

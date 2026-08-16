@@ -21,6 +21,7 @@ from growth_os.api.schemas import (
     Pagination,
 )
 from growth_os.db.models import ActionProposal
+from growth_os.execution import ExecutionStatus
 from growth_os.execution_repository import ExecutionRepository
 from growth_os.execution_service import ExecutionService, JobResult
 from growth_os.repositories import TenantContext
@@ -48,6 +49,9 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
     Context = Annotated[TenantContext, Depends(tenant_context)]
     Limit = Annotated[int, Query(ge=1, le=100)]
     Offset = Annotated[int, Query(ge=0)]
+    JobKindFilter = Annotated[
+        str | None, Query(min_length=1, max_length=100, pattern=r"^[a-z0-9_-]+$")
+    ]
 
     def service(session: AsyncSession) -> ExecutionService:
         return ExecutionService(ExecutionRepository(session))
@@ -86,9 +90,22 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
 
     @router.get("/tenants/{tenant_id}/execution-jobs", response_model=Page[ExecutionJobResponse])
     async def list_jobs(
-        context: Context, session: Session, limit: Limit = 50, offset: Offset = 0
+        context: Context,
+        session: Session,
+        workspace_id: UUID | None = None,
+        status: ExecutionStatus | None = None,
+        kind: JobKindFilter = None,
+        limit: Limit = 50,
+        offset: Offset = 0,
     ) -> Page[ExecutionJobResponse]:
-        results, total = await service(session).list_jobs(context, limit=limit, offset=offset)
+        results, total = await service(session).list_jobs(
+            context,
+            workspace_id=workspace_id,
+            status=status,
+            kind=kind,
+            limit=limit,
+            offset=offset,
+        )
         return page([job_response(result) for result in results], total, limit, offset)
 
     @router.get(

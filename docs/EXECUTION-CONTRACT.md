@@ -42,6 +42,16 @@ Tenant-scoped `/api/v1` endpoints create, list, and read execution jobs and acti
 record proposal decisions; transition jobs; and list audit events. Collection responses use
 FOUNDATION-003's bounded `limit`/`offset` pagination and errors retain its structured envelope.
 
+`GET /api/v1/tenants/{tenant_id}/execution-jobs` accepts optional `workspace_id`, `status`, and
+`kind` filters. Every query retains the tenant predicate, and supplied filters compose with logical
+AND. A workspace filter is resolved through the existing tenant-owned workspace boundary before
+jobs are queried, so missing and cross-tenant workspace identifiers both return `not_found`.
+Status values use the canonical execution status enum; kind values use job creation's non-empty,
+1–100 character lowercase identifier contract. The same predicate is applied independently to
+the deterministically ordered page and its full total. Unfiltered requests retain the existing
+response, `(created_at, id)` ordering, bounded `limit`/`offset`, and empty-page behavior. Listing is
+strictly read-only and creates no audit event.
+
 `GET /api/v1/tenants/{tenant_id}/execution-jobs/{job_id}/runs` exposes immutable attempt history
 using the existing execution-run response and collection pagination contracts. The service first
 requires the parent job to exist in the same tenant context, so missing and cross-tenant jobs both
@@ -109,9 +119,9 @@ unchanged.
 
 ## Rollback
 
-FOUNDATION-008, FOUNDATION-009, and FOUNDATION-010 have no migrations. Revert their respective
-implementation commits to remove the transition, retry, or run-history endpoint. Existing job,
+FOUNDATION-008 through FOUNDATION-011 have no migrations. Revert their respective implementation
+commits to remove the transition, retry, run-history endpoint, or job-list filters. Existing job,
 run, and audit rows remain valid; successful transitions and retry reservations already committed
-are historical state and are not reversed by the code rollback. Removing the run-history endpoint
-has no data effect. The earlier additive migration rollback remains available, but dropping those
-tables would delete control-plane history and requires a backup first.
+are historical state and are not reversed by the code rollback. Removing read-only history or
+filtering has no data effect. The earlier additive migration rollback remains available, but
+dropping those tables would delete control-plane history and requires a backup first.

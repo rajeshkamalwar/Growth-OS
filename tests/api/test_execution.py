@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -73,13 +74,14 @@ async def create_job(
     workspace: dict[str, object],
     *,
     key: str = "crawl-homepage-1",
+    kind: str = "site_analysis",
 ) -> dict[str, object]:
     response = await client.post(
         f"/api/v1/tenants/{tenant['id']}/execution-jobs",
         headers=headers(tenant),
         json={
             "workspace_id": workspace["id"],
-            "kind": "site_analysis",
+            "kind": kind,
             "idempotency_key": key,
             "max_attempts": 3,
         },
@@ -320,6 +322,213 @@ async def test_job_and_proposal_lists_are_tenant_scoped(client: AsyncClient) -> 
     assert [item["id"] for item in jobs_response.json()["items"]] == [job_a["id"]]
     assert proposals_response.status_code == 200
     assert [item["id"] for item in proposals_response.json()["items"]] == [proposal_a["id"]]
+
+
+async def test_job_list_filters_individually_and_composes_with_and_semantics(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace_a = await setup_tenant(client, "Filtered Jobs")
+    workspace_response = await client.post(
+        f"/api/v1/tenants/{tenant['id']}/workspaces",
+        headers=headers(tenant),
+        json={"name": "Secondary"},
+    )
+    workspace_b = workspace_response.json()
+    queued_site = await create_job(client, tenant, workspace_a, key="queued-site")
+    running_site = await create_job(client, tenant, workspace_a, key="running-site")
+    queued_report = await create_job(
+        client, tenant, workspace_b, key="queued-report", kind="daily_report"
+    )
+    await set_job_and_run_status(
+        session_factory, tenant["id"], running_site["id"], ExecutionStatus.RUNNING
+    )
+
+    async def filtered(query: str) -> dict[str, object]:
+        response = await client.get(
+            f"/api/v1/tenants/{tenant['id']}/execution-jobs?{query}",
+            headers=headers(tenant),
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    by_workspace = await filtered(f"workspace_id={workspace_a['id']}")
+    by_status = await filtered("status=running")
+    by_kind = await filtered("kind=daily_report")
+    composed = await filtered(f"workspace_id={workspace_a['id']}&status=queued&kind=site_analysis")
+
+    assert {item["id"] for item in by_workspace["items"]} == {
+        queued_site["id"],
+        running_site["id"],
+    }
+    assert [item["id"] for item in by_status["items"]] == [running_site["id"]]
+    assert [item["id"] for item in by_kind["items"]] == [queued_report["id"]]
+    assert [item["id"] for item in composed["items"]] == [queued_site["id"]]
+    assert composed["pagination"]["total"] == 1
+
+
+async def test_filtered_job_list_paginates_with_full_total_and_valid_empty_page(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Filtered Pagination")
+    first = await create_job(client, tenant, workspace, key="first-report", kind="report")
+    second = await create_job(client, tenant, workspace, key="second-report", kind="report")
+    await create_job(client, tenant, workspace, key="analysis", kind="analysis")
+
+    tied_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    async with session_factory() as session:
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.id.in_([UUID(str(first["id"])), UUID(str(second["id"]))]))
+            .values(created_at=tied_created_at)
+        )
+        await session.commit()
+
+    first_page = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs?kind=report&limit=1&offset=0",
+        headers=headers(tenant),
+    )
+    second_page = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs?kind=report&limit=1&offset=1",
+        headers=headers(tenant),
+    )
+    empty_page = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs?kind=report&limit=1&offset=2",
+        headers=headers(tenant),
+    )
+
+    ordered_ids = sorted([str(first["id"]), str(second["id"])])
+    assert [item["id"] for item in first_page.json()["items"]] == ordered_ids[:1]
+    assert [item["id"] for item in second_page.json()["items"]] == ordered_ids[1:]
+    assert first_page.json()["pagination"]["total"] == 2
+    assert empty_page.json() == {
+        "items": [],
+        "pagination": {"limit": 1, "offset": 2, "total": 2},
+    }
+
+
+async def test_job_workspace_filter_hides_missing_and_cross_tenant_workspaces(
+    client: AsyncClient,
+) -> None:
+    tenant_a, _workspace_a = await setup_tenant(client, "Filter Tenant A")
+    tenant_b, workspace_b = await setup_tenant(client, "Filter Tenant B")
+    await create_job(client, tenant_b, workspace_b, key="tenant-b-job")
+
+    missing = await client.get(
+        f"/api/v1/tenants/{tenant_a['id']}/execution-jobs?workspace_id={uuid4()}",
+        headers=headers(tenant_a),
+    )
+    cross_tenant = await client.get(
+        f"/api/v1/tenants/{tenant_a['id']}/execution-jobs?workspace_id={workspace_b['id']}",
+        headers=headers(tenant_a),
+    )
+
+    assert missing.status_code == cross_tenant.status_code == 404
+    assert missing.json()["error"]["code"] == "not_found"
+    assert cross_tenant.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "status=unknown",
+        "kind=",
+        "kind=UPPER",
+        f"kind={'a' * 101}",
+        "limit=0",
+        "limit=101",
+        "offset=-1",
+    ],
+)
+async def test_job_filters_retain_structured_validation_errors(
+    client: AsyncClient, query: str
+) -> None:
+    tenant, _workspace = await setup_tenant(client, f"Invalid job filter {query}")
+
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs?{query}", headers=headers(tenant)
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_filtered_job_endpoint_has_no_write_or_audit_side_effect(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Read Only Job Filter")
+    await create_job(client, tenant, workspace, key="read-only-job")
+    async with session_factory() as session:
+        before = (
+            await session.scalar(select(func.count()).select_from(ExecutionJob)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs?status=queued",
+        headers=headers(tenant),
+    )
+
+    async with session_factory() as session:
+        after = (
+            await session.scalar(select(func.count()).select_from(ExecutionJob)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+    assert response.status_code == 200
+    assert after == before
+
+
+async def test_filtered_job_repository_is_tenant_safe_deterministic_and_read_only(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_a, workspace_a = await setup_tenant(client, "Repository Filter A")
+    tenant_b, workspace_b = await setup_tenant(client, "Repository Filter B")
+    first = await create_job(client, tenant_a, workspace_a, key="repo-first", kind="report")
+    second = await create_job(client, tenant_a, workspace_a, key="repo-second", kind="report")
+    await create_job(client, tenant_a, workspace_a, key="repo-other", kind="analysis")
+    await create_job(client, tenant_b, workspace_b, key="repo-foreign", kind="report")
+    tenant_id = UUID(str(tenant_a["id"]))
+
+    first_id = UUID(str(first["id"]))
+    second_id = UUID(str(second["id"]))
+    ids_by_uuid = sorted([first_id, second_id], key=str)
+    lower_uuid_later_id, higher_uuid_earlier_id = ids_by_uuid
+    earlier_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    async with session_factory() as session:
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.id == higher_uuid_earlier_id)
+            .values(created_at=earlier_created_at)
+        )
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.id == lower_uuid_later_id)
+            .values(created_at=earlier_created_at + timedelta(seconds=1))
+        )
+        await session.commit()
+        repository = ExecutionRepository(session)
+        before = (
+            await session.scalar(select(func.count()).select_from(ExecutionJob)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+        jobs, total = await repository.list_jobs_with_latest_runs(
+            TenantContext(tenant_id=tenant_id),
+            kind="report",
+            limit=1,
+            offset=1,
+        )
+        after = (
+            await session.scalar(select(func.count()).select_from(ExecutionJob)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+
+    assert total == 2
+    assert [job.id for job, _run in jobs] == [lower_uuid_later_id]
+    assert after == before
 
 
 async def test_run_history_returns_all_attempts_in_stable_order_and_existing_shape(
