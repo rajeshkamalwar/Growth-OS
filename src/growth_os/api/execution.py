@@ -52,6 +52,13 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
     JobKindFilter = Annotated[
         str | None, Query(min_length=1, max_length=100, pattern=r"^[a-z0-9_-]+$")
     ]
+    AuditEventTypeFilter = Annotated[
+        str | None,
+        Query(min_length=1, max_length=100, pattern=r"^[a-z0-9_]+(?:\.[a-z0-9_]+)*$"),
+    ]
+    AuditResourceTypeFilter = Annotated[
+        str | None, Query(min_length=1, max_length=100, pattern=r"^[a-z0-9_]+$")
+    ]
 
     def service(session: AsyncSession) -> ExecutionService:
         return ExecutionService(ExecutionRepository(session))
@@ -233,10 +240,23 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
 
     @router.get("/tenants/{tenant_id}/audit-events", response_model=Page[AuditEventResponse])
     async def list_audit_events(
-        context: Context, session: Session, limit: Limit = 50, offset: Offset = 0
+        context: Context,
+        session: Session,
+        event_type: AuditEventTypeFilter = None,
+        resource_type: AuditResourceTypeFilter = None,
+        resource_id: UUID | None = None,
+        actor_id: UUID | None = None,
+        limit: Limit = 50,
+        offset: Offset = 0,
     ) -> Page[AuditEventResponse]:
         events, total = await service(session).repository.list_audit_events(
-            context, limit=limit, offset=offset
+            context,
+            event_type=event_type,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            actor_id=actor_id,
+            limit=limit,
+            offset=offset,
         )
         return page(
             [AuditEventResponse.model_validate(item) for item in events], total, limit, offset
