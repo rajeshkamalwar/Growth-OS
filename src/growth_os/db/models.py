@@ -54,6 +54,13 @@ class ApprovalDecisionValue(StrEnum):
     REJECTED = "rejected"
 
 
+class AutonomyLevel(StrEnum):
+    OBSERVE_ONLY = "observe_only"
+    RECOMMEND_ONLY = "recommend_only"
+    APPROVAL_REQUIRED = "approval_required"
+    LOW_RISK_AUTO = "low_risk_auto"
+
+
 class Tenant(UUIDTimestampMixin, Base):
     __tablename__ = "tenants"
 
@@ -122,6 +129,44 @@ class WorkspacePrimaryGrowthGoal(UUIDTimestampMixin, Base):
     objective: Mapped[str] = mapped_column(String(2000), nullable=False)
     success_definition: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
+class WorkspaceAutonomyPolicy(UUIDTimestampMixin, Base):
+    __tablename__ = "workspace_autonomy_policies"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "tenant_id"],
+            ["workspaces.id", "workspaces.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_workspace_autonomy_policies_workspace_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "workspace_id",
+            name="uq_workspace_autonomy_policies_tenant_workspace",
+        ),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(nullable=False)
+    workspace_id: Mapped[UUID] = mapped_column(nullable=False)
+    level: Mapped[AutonomyLevel] = mapped_column(
+        Enum(
+            AutonomyLevel,
+            native_enum=False,
+            create_constraint=True,
+            name="autonomy_level",
+            values_callable=lambda enum: [item.value for item in enum],
+            length=20,
+        ),
+        nullable=False,
+    )
+    is_paused: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
+
+    def __init__(self, **kwargs: object) -> None:
+        kwargs.setdefault("is_paused", True)
+        super().__init__(**kwargs)
 
 
 class Membership(UUIDTimestampMixin, Base):

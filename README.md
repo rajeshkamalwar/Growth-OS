@@ -48,6 +48,14 @@ the optional `success_definition` and ISO calendar `target_date` may be explicit
 attainment, attribution, or proof of business performance. Successful mutations add one redacted
 audit event containing only the workspace ID and alphabetically sorted supplied field names.
 
+Each workspace may store one autonomy preference at
+`/api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/autonomy-policy`. Use `POST` to create,
+`GET` to retrieve, and `PATCH` to update the required autonomy level or strict boolean pause flag.
+New policies are paused by default. These values are stored customer intent only: they do not
+grant permission, change approval requirements, start work, or enforce a runtime kill switch.
+Successful mutations add one redacted audit event containing only the workspace ID and
+alphabetically sorted explicitly supplied policy field names.
+
 Run the complete local verification suite with:
 
 ```bash
@@ -73,3 +81,10 @@ goal operations without deleting stored intent. The PRODUCT-002 downgrade drops 
 and permanently deletes its goal records, so it is limited to disposable development databases.
 Before any approved downgrade against meaningful shared or production data, obtain explicit
 approval, take and verify a backup, and document and test recovery.
+
+For PRODUCT-003, revert the application code while retaining the additive
+`workspace_autonomy_policies` table to stop new policy operations without deleting preferences.
+Retaining the table cannot trigger actions because this milestone adds no enforcement consumer.
+The PRODUCT-003 downgrade drops only that table and permanently deletes its policy rows, so use it
+only in a disposable development database. Downgrading meaningful shared or production data
+requires explicit approval, a verified backup, and a documented, tested recovery plan.
