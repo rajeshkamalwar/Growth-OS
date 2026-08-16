@@ -14,7 +14,8 @@ The flow is:
 3. Install and authenticate Codex CLI.
 4. Keep the repository checkout clean when the controller runs.
 
-The controller uses the repository's existing `AGENTS.md` safety contract and never merges or deploys.
+The controller uses the repository's existing `AGENTS.md` safety contract. This milestone
+creates draft PRs but does not review, merge, or deploy them.
 
 ## Install Codex CLI
 
@@ -38,6 +39,24 @@ From the repository root:
 python3 devtools/codex_handoff.py --once
 ```
 
+## Run continuously
+
+From the repository root:
+
+```bash
+python3 devtools/codex_handoff.py --watch
+```
+
+The default polling interval is 60 seconds. Set an explicit interval from 5 to 3600 seconds:
+
+```bash
+python3 devtools/codex_handoff.py --watch --poll-interval 30
+```
+
+`GROWTH_OS_POLL_INTERVAL` can supply the default when `--poll-interval` is omitted. Only one
+controller may run at a time. A second controller rejects a live lock, while a lock left by a
+dead process is recovered automatically.
+
 The controller looks for the oldest open issue labeled `codex-ready`.
 
 It will only accept an issue authored by `rajeshkamalwar` by default. Override only intentionally:
@@ -58,11 +77,11 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 7. The controller opens a draft PR and posts the PR link back to the issue.
 8. The issue receives `codex-pr-open`.
 9. ChatGPT can inspect the PR directly through GitHub.
-10. A human still approves merge for now.
+10. Review and merge automation is a separate milestone; this controller stops at a draft PR.
 
 ## Safety rules
 
-- No automatic merge.
+- No automatic review or merge in the current controller.
 - No automatic production deployment.
 - Only issues explicitly labeled `codex-ready` run.
 - Only the configured repository owner's issues are accepted.
@@ -72,10 +91,9 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 - `AGENTS.md` remains authoritative.
 - Approval-gated architecture/auth/billing/tenant/destructive changes remain blocked.
 
-## Why `--once` initially
-
-The first version intentionally processes one task per invocation. After this path is proven reliable, macOS `launchd` can invoke it periodically (for example every minute) without changing controller logic. This keeps the first rollout inspectable and easy to stop.
-
 ## Emergency stop
 
-Stop any running controller/Codex process and remove `codex-ready` from queued issues. The controller never merges or deploys, so stopping it cannot publish code to production.
+Press Ctrl-C to stop watch mode. The controller records `STOPPED` status and releases its lock.
+If Codex is actively processing an issue, the interruption is also recorded as an issue failure
+so the queue cannot advance silently. Remove `codex-ready` from queued issues to prevent them
+from starting on the next run. The current controller never merges or deploys.

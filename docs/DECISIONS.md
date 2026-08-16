@@ -38,3 +38,14 @@ Auth, billing, tenant boundaries, destructive database operations, secrets, larg
 
 ## D-013 — Doing nothing is a valid action
 Agents are not required to make changes when monitoring finds no justified intervention.
+
+## D-014 — Development auto-merge is bounded
+Codex/Goal Orchestrator may merge roadmap-authorized low- or medium-risk development PRs only
+after all local quality gates and a separate blocking-issue-free reviewer pass succeed. It must
+stop for high-risk domains and external side effects. Merge authorization never implies
+production deployment authorization.
+
+## D-015 — The local controller may persistently poll
+The development handoff controller may run a bounded polling loop with one live instance,
+recover stale locks, stop cleanly, and fail closed on task errors. Operating-system service
+installation and automated reviewer/fix/merge behavior are separate milestones.
