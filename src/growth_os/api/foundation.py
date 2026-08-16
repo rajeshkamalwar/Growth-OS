@@ -19,6 +19,7 @@ from growth_os.api.schemas import (
     MembershipCreate,
     MembershipResponse,
     MembershipUpdate,
+    OnboardingStatusResponse,
     Page,
     Pagination,
     PrimaryGrowthGoalCreate,
@@ -72,6 +73,15 @@ def create_foundation_router(
             items=items,
             pagination=Pagination(limit=limit, offset=offset, total=total),
         )
+
+    @router.get(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/onboarding-status",
+        response_model=OnboardingStatusResponse,
+    )
+    async def get_onboarding_status(
+        workspace_id: UUID, context: Context, session: Session
+    ) -> OnboardingStatusResponse:
+        return await service(session).get_onboarding_status(context, workspace_id)
 
     @router.post("/tenants", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
     async def create_tenant(payload: TenantCreate, session: Session) -> object:

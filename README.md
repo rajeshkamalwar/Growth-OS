@@ -56,6 +56,17 @@ grant permission, change approval requirements, start work, or enforce a runtime
 Successful mutations add one redacted audit event containing only the workspace ID and
 alphabetically sorted explicitly supplied policy field names.
 
+Read foundational onboarding completeness with
+`GET /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/onboarding-status`. The response reports
+only whether the workspace has at least one site and stored business-profile, primary-growth-goal,
+and autonomy-policy records, plus the canonically ordered missing records. It does not expose the
+underlying content and creates no audit event or other side effect.
+
+This status means foundational record completeness only. It is not connector authentication,
+monitoring readiness, approval, permission, policy enforcement, execution eligibility, evidence
+that Growth OS is operational, or any other operational-readiness claim. Autonomy values are not
+read or applied; policy presence is only the presence of a stored onboarding record.
+
 Run the complete local verification suite with:
 
 ```bash

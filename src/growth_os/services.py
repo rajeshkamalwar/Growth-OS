@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 
 from growth_os.api.errors import ConflictError, NotFoundError
+from growth_os.api.schemas import OnboardingStatusResponse, OnboardingStep
 from growth_os.db.models import (
     AuditEvent,
     Connector,
@@ -28,6 +29,29 @@ class FoundationService:
 
     async def create_tenant(self, *, name: str) -> Tenant:
         return await self._persist(Tenant(name=name))
+
+    async def get_onboarding_status(
+        self, context: TenantContext, workspace_id: UUID
+    ) -> OnboardingStatusResponse:
+        await self.get_owned(Workspace, context, workspace_id)
+        status = await self.repository.get_onboarding_record_status(context, workspace_id)
+        ordered_steps = (
+            (OnboardingStep.SITE, status.has_site),
+            (OnboardingStep.BUSINESS_PROFILE, status.has_business_profile),
+            (OnboardingStep.PRIMARY_GROWTH_GOAL, status.has_primary_growth_goal),
+            (OnboardingStep.AUTONOMY_POLICY, status.has_autonomy_policy),
+        )
+        flags = tuple(present for _, present in ordered_steps)
+        return OnboardingStatusResponse(
+            tenant_id=context.tenant_id,
+            workspace_id=workspace_id,
+            has_site=status.has_site,
+            has_business_profile=status.has_business_profile,
+            has_primary_growth_goal=status.has_primary_growth_goal,
+            has_autonomy_policy=status.has_autonomy_policy,
+            is_foundation_complete=all(flags),
+            missing_steps=[step for step, present in ordered_steps if not present],
+        )
 
     async def get_tenant(self, context: TenantContext) -> Tenant:
         tenant = await self.repository.get_tenant(context)

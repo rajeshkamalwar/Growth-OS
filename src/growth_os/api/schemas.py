@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from enum import StrEnum
 from typing import Annotated, TypeVar
 from uuid import UUID
 
@@ -88,6 +89,24 @@ class WorkspaceUpdate(StrictInput):
 class WorkspaceResponse(AuditFields):
     tenant_id: UUID
     name: str
+
+
+class OnboardingStep(StrEnum):
+    SITE = "site"
+    BUSINESS_PROFILE = "business_profile"
+    PRIMARY_GROWTH_GOAL = "primary_growth_goal"
+    AUTONOMY_POLICY = "autonomy_policy"
+
+
+class OnboardingStatusResponse(BaseModel):
+    tenant_id: UUID
+    workspace_id: UUID
+    has_site: bool
+    has_business_profile: bool
+    has_primary_growth_goal: bool
+    has_autonomy_policy: bool
+    is_foundation_complete: bool
+    missing_steps: list[OnboardingStep]
 
 
 class BusinessProfileCreate(StrictInput):
