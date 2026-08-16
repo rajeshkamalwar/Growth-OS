@@ -119,6 +119,29 @@ def comment(issue_number: int, text: str) -> None:
     run("gh", "issue", "comment", str(issue_number), "--repo", REPO, "--body", text)
 
 
+def prepare_task_branch(branch: str) -> None:
+    run("git", "fetch", "origin", "main")
+    run("git", "checkout", "main")
+    run("git", "pull", "--ff-only", "origin", "main")
+
+    local_branch = run("git", "branch", "--list", branch).stdout.strip()
+    if local_branch:
+        run("git", "branch", "-D", branch)
+
+    remote_branch = run("git", "ls-remote", "--heads", "origin", branch).stdout.strip()
+    if remote_branch:
+        raise RuntimeError(
+            f"Remote task branch already exists: {branch}. Refusing to overwrite it automatically."
+        )
+
+    run("git", "checkout", "-b", branch)
+
+
+def reset_noop_branch(branch: str) -> None:
+    run("git", "checkout", "main")
+    subprocess.run(["git", "branch", "-D", branch], capture_output=True, text=True)
+
+
 def process_issue(issue: dict) -> None:
     number = int(issue["number"])
     title = issue["title"]
@@ -128,25 +151,33 @@ def process_issue(issue: dict) -> None:
     label(number, add=RUNNING_LABEL, remove=READY_LABEL)
     comment(number, f"Local Codex controller started this task on branch `{branch}`.")
 
-    run("git", "fetch", "origin", "main")
-    run("git", "checkout", "main")
-    run("git", "pull", "--ff-only", "origin", "main")
-    run("git", "checkout", "-b", branch)
+    prepare_task_branch(branch)
 
-    prompt = f"""Read AGENTS.md and all repository source-of-truth documents before making changes.
+    prompt = f"""You are the implementation agent for this repository.
 
-Execute GitHub issue #{number}: {title}
+Before making changes, read AGENTS.md and every source-of-truth document it requires.
+Then execute GitHub issue #{number}: {title}
+
+The GitHub issue below is an implementation contract, not a suggestion.
 
 Issue body:
 {body}
 
-Hard requirements:
-- Obey AGENTS.md and repository safety gates.
+Execution rules:
+- Obey AGENTS.md and all repository safety gates.
+- Inspect the current repository before deciding what work is needed.
+- Implement the requested scope completely and minimally.
 - Stay strictly within this issue's scope.
 - Do not merge, deploy, modify production, or weaken safety controls.
-- Run relevant tests/checks before finishing.
+- Run all relevant tests/checks before finishing.
 - Leave the working tree containing only justified task changes.
-- If the issue conflicts with source-of-truth docs or requires a stop/approval condition, do not bypass it; exit with a clear explanation.
+- If the issue conflicts with source-of-truth docs or requires a stop/approval condition, stop and explain the exact conflict instead of bypassing it.
+- Do NOT return a no-change result merely because related foundation code already exists.
+- A no-change result is allowed only if every acceptance criterion in the issue is already satisfied by the current repository state. If you believe that is true, you must verify each acceptance criterion with concrete repository evidence and relevant commands/tests before concluding no changes are required.
+- For implementation tasks, prefer making the necessary code/test/documentation changes over describing what could be changed.
+
+Completion expectation:
+Finish with a concise implementation summary covering files changed, architecture choices, checks run and results, acceptance-criteria status, risks/limitations, and rollback notes.
 """
 
     result = run("codex", "exec", "--sandbox", "workspace-write", input_text=prompt, check=False)
@@ -155,9 +186,14 @@ Hard requirements:
 
     changed = run("git", "status", "--porcelain").stdout.strip()
     if not changed:
-        comment(number, "Codex completed without repository changes. No PR was created.")
-        label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
-        return
+        output = (result.stdout or "").strip()
+        reset_noop_branch(branch)
+        raise RuntimeError(
+            "Codex returned successfully but produced no repository changes for an implementation task. "
+            "The controller now treats this as a failed handoff so the task can be reviewed/requeued instead "
+            "of being falsely marked complete.\n\n"
+            f"Codex output:\n{output[-3000:]}"
+        )
 
     run("git", "add", "-A")
     run("git", "commit", "-m", f"codex: resolve issue #{number}")
