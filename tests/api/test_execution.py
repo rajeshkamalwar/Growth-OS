@@ -675,6 +675,18 @@ async def test_retry_reserves_next_attempt_preserves_history_and_records_audit(
     tenant, workspace = await setup_tenant(client, "Retry Tenant")
     job = await create_job(client, tenant, workspace)
     await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    async with session_factory() as session:
+        prior_run = await session.get(ExecutionRun, UUID(str(job["latest_run"]["id"])))
+        assert prior_run is not None
+        prior_run.max_attempts = 7
+        prior_run.retry_delay_seconds = 43
+        prior_run.last_error_code = "provider_timeout"
+        await session.commit()
+        await session.refresh(prior_run)
+        prior_before = {
+            column.name: getattr(prior_run, column.name)
+            for column in ExecutionRun.__table__.columns
+        }
     actor_id = str(uuid4())
 
     response = await retry_job(client, tenant, job, 1, actor_id=actor_id)
@@ -684,8 +696,8 @@ async def test_retry_reserves_next_attempt_preserves_history_and_records_audit(
     assert body["status"] == "queued"
     assert body["latest_run"]["attempt_number"] == 2
     assert body["latest_run"]["status"] == "queued"
-    assert body["latest_run"]["max_attempts"] == 3
-    assert body["latest_run"]["retry_delay_seconds"] == 0
+    assert body["latest_run"]["max_attempts"] == 7
+    assert body["latest_run"]["retry_delay_seconds"] == 43
     assert body["latest_run"]["last_error_code"] is None
     async with session_factory() as session:
         runs = list(
@@ -697,6 +709,10 @@ async def test_retry_reserves_next_attempt_preserves_history_and_records_audit(
                 )
             ).all()
         )
+        prior_after = {
+            column.name: getattr(runs[0], column.name) for column in ExecutionRun.__table__.columns
+        }
+    assert prior_after == prior_before
     assert [(run.attempt_number, run.status) for run in runs] == [
         (1, ExecutionStatus.FAILED),
         (2, ExecutionStatus.QUEUED),
@@ -734,6 +750,55 @@ async def test_retry_rejects_non_failed_state_without_side_effects(
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "invalid_state_transition"
+
+
+@pytest.mark.parametrize(
+    ("job_status", "run_status"),
+    [
+        (ExecutionStatus.FAILED, ExecutionStatus.QUEUED),
+        (ExecutionStatus.QUEUED, ExecutionStatus.FAILED),
+    ],
+)
+async def test_retry_rejects_inconsistent_job_and_run_without_side_effects(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    job_status: ExecutionStatus,
+    run_status: ExecutionStatus,
+) -> None:
+    tenant, workspace = await setup_tenant(client, f"Retry mismatch {job_status} {run_status}")
+    job = await create_job(client, tenant, workspace)
+    tenant_id = UUID(str(tenant["id"]))
+    job_id = UUID(str(job["id"]))
+    async with session_factory() as session:
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.tenant_id == tenant_id, ExecutionJob.id == job_id)
+            .values(status=job_status)
+        )
+        await session.execute(
+            update(ExecutionRun)
+            .where(ExecutionRun.tenant_id == tenant_id, ExecutionRun.job_id == job_id)
+            .values(status=run_status)
+        )
+        await session.commit()
+
+    response = await retry_job(client, tenant, job, 1)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "invalid_state_transition"
+    async with session_factory() as session:
+        current_job = await session.get(ExecutionJob, job_id)
+        runs = list(
+            (await session.scalars(select(ExecutionRun).where(ExecutionRun.job_id == job_id))).all()
+        )
+        audit_count = await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.event_type == "execution_job.retry_reserved")
+        )
+    assert current_job is not None and current_job.status is job_status
+    assert len(runs) == 1 and runs[0].status is run_status
+    assert audit_count == 0
 
 
 async def test_retry_rejects_stale_repeated_and_exhausted_attempts(
@@ -803,6 +868,13 @@ async def test_retry_insert_failure_rolls_back_job_and_audit(
     )
     assert current.json()["status"] == "failed"
     assert current.json()["latest_run"]["attempt_number"] == 1
+    async with session_factory() as session:
+        audit_count = await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.event_type == "execution_job.retry_reserved")
+        )
+    assert audit_count == 0
 
 
 async def test_two_competing_retry_requests_cannot_both_succeed(
