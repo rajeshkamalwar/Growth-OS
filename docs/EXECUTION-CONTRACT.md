@@ -1,7 +1,7 @@
 # Execution and Approval Contract
 
-FOUNDATION-004 defines control-plane state only. It deliberately has no executor and cannot
-perform an external action.
+The execution contract defines control-plane state and atomic lifecycle changes only. It
+deliberately has no executor and cannot perform an external action.
 
 ## Entities
 
@@ -39,14 +39,38 @@ use the same key safely.
 ## API Surface
 
 Tenant-scoped `/api/v1` endpoints create, list, and read execution jobs and action proposals;
-record proposal decisions; and list audit events. Collection responses use FOUNDATION-003's
-bounded `limit`/`offset` pagination and errors retain its structured envelope.
+record proposal decisions; transition jobs; and list audit events. Collection responses use
+FOUNDATION-003's bounded `limit`/`offset` pagination and errors retain its structured envelope.
 
-The `decided_by` identifier is provider-neutral audit attribution, not a new authorization
-system. The existing tenant-context boundary remains unchanged.
+`POST /api/v1/tenants/{tenant_id}/execution-jobs/{job_id}/transitions` accepts a strict body:
+
+```json
+{
+  "expected_status": "queued",
+  "target_status": "running",
+  "actor_id": "optional-provider-neutral-uuid"
+}
+```
+
+The service resolves the tenant-owned job and its highest-attempt run in one transaction. Both
+must match `expected_status`, and the canonical execution graph must allow the requested edge.
+Tenant-qualified compare-and-set updates apply the target to both records. A zero-row update,
+stale expectation, inconsistent status, invalid edge, or consumed transition rolls back and
+returns the structured `invalid_state_transition` conflict without an audit event. Missing or
+cross-tenant jobs remain indistinguishable as `not_found`.
+
+A successful transition appends one `execution_job.transitioned` audit event in the same
+transaction. Its details contain `prior_status`, `target_status`, and `run_id`; `actor_id` is
+recorded when supplied. The response is the existing execution-job contract with the updated
+latest run.
+
+The `decided_by` and transition `actor_id` identifiers are provider-neutral audit attribution,
+not a new authorization system. The existing tenant-context boundary remains unchanged.
 
 ## Rollback
 
-The migration is additive. Downgrading one revision drops only the execution, proposal,
-decision, and audit tables in dependency order. Back up any control-plane history before a
-downgrade because those newly introduced records will be lost.
+FOUNDATION-008 has no migration. Revert its implementation commit to remove the transition
+endpoint and stop new transition audit events. Existing job, run, and audit rows remain valid;
+successful transitions already committed are historical state and are not reversed by the code
+rollback. The earlier additive migration rollback remains available, but dropping those tables
+would delete control-plane history and requires a backup first.

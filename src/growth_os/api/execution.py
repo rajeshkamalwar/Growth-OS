@@ -15,6 +15,7 @@ from growth_os.api.schemas import (
     ExecutionJobCreate,
     ExecutionJobResponse,
     ExecutionRunResponse,
+    ExecutionTransitionCreate,
     Page,
     Pagination,
 )
@@ -97,6 +98,25 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
         resource_id: UUID, context: Context, session: Session
     ) -> ExecutionJobResponse:
         return job_response(await service(session).get_job(context, resource_id))
+
+    @router.post(
+        "/tenants/{tenant_id}/execution-jobs/{resource_id}/transitions",
+        response_model=ExecutionJobResponse,
+    )
+    async def transition_job(
+        resource_id: UUID,
+        payload: ExecutionTransitionCreate,
+        context: Context,
+        session: Session,
+    ) -> ExecutionJobResponse:
+        result = await service(session).transition_job(
+            context,
+            resource_id,
+            expected_status=payload.expected_status,
+            target_status=payload.target_status,
+            actor_id=payload.actor_id,
+        )
+        return job_response(result)
 
     @router.post(
         "/tenants/{tenant_id}/action-proposals",

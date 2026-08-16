@@ -1,11 +1,12 @@
 from typing import TypeVar, cast
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from growth_os.db.base import Base
 from growth_os.db.models import ActionProposal, AuditEvent, ExecutionJob, ExecutionRun
+from growth_os.execution import ExecutionStatus
 from growth_os.repositories import TenantContext
 
 ExecutionOwned = TypeVar("ExecutionOwned", ExecutionJob, ActionProposal)
@@ -54,6 +55,44 @@ class ExecutionRepository:
                 .limit(1)
             ),
         )
+
+    async def compare_and_set_job_status(
+        self,
+        context: TenantContext,
+        job_id: UUID,
+        expected_status: ExecutionStatus,
+        target_status: ExecutionStatus,
+    ) -> bool:
+        updated_id = await self.session.scalar(
+            update(ExecutionJob)
+            .where(
+                ExecutionJob.id == job_id,
+                ExecutionJob.tenant_id == context.tenant_id,
+                ExecutionJob.status == expected_status,
+            )
+            .values(status=target_status)
+            .returning(ExecutionJob.id)
+        )
+        return updated_id is not None
+
+    async def compare_and_set_run_status(
+        self,
+        context: TenantContext,
+        run_id: UUID,
+        expected_status: ExecutionStatus,
+        target_status: ExecutionStatus,
+    ) -> bool:
+        updated_id = await self.session.scalar(
+            update(ExecutionRun)
+            .where(
+                ExecutionRun.id == run_id,
+                ExecutionRun.tenant_id == context.tenant_id,
+                ExecutionRun.status == expected_status,
+            )
+            .values(status=target_status)
+            .returning(ExecutionRun.id)
+        )
+        return updated_id is not None
 
     async def list_jobs_with_latest_runs(
         self,

@@ -15,7 +15,7 @@ from growth_os.db.models import (
     RiskLevel,
     Workspace,
 )
-from growth_os.execution import ExecutionStatus
+from growth_os.execution import ExecutionStatus, validate_transition
 from growth_os.execution_repository import ExecutionOwned, ExecutionRepository
 from growth_os.repositories import FoundationRepository, TenantContext
 from growth_os.services import FoundationService
@@ -94,6 +94,60 @@ class ExecutionService:
     async def get_job(self, context: TenantContext, job_id: UUID) -> JobResult:
         job = await self.get_owned(ExecutionJob, context, job_id)
         run = await self._required_run(context, job.id)
+        return JobResult(job, run, False)
+
+    async def transition_job(
+        self,
+        context: TenantContext,
+        job_id: UUID,
+        *,
+        expected_status: ExecutionStatus,
+        target_status: ExecutionStatus,
+        actor_id: UUID | None,
+    ) -> JobResult:
+        try:
+            validate_transition(expected_status, target_status)
+        except ValueError as error:
+            raise InvalidStateTransitionError() from error
+
+        job = await self.get_owned(ExecutionJob, context, job_id)
+        run = await self._required_run(context, job.id)
+        if job.status is not expected_status or run.status is not expected_status:
+            raise InvalidStateTransitionError()
+
+        job_updated = await self.repository.compare_and_set_job_status(
+            context, job.id, expected_status, target_status
+        )
+        if not job_updated:
+            await self.repository.rollback()
+            raise InvalidStateTransitionError()
+        run_updated = await self.repository.compare_and_set_run_status(
+            context, run.id, expected_status, target_status
+        )
+        if not run_updated:
+            await self.repository.rollback()
+            raise InvalidStateTransitionError()
+
+        audit = self._audit(
+            context,
+            "execution_job.transitioned",
+            "execution_job",
+            job.id,
+            actor_id=actor_id,
+            details={
+                "prior_status": expected_status.value,
+                "target_status": target_status.value,
+                "run_id": str(run.id),
+            },
+        )
+        self.repository.add_all(audit)
+        try:
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            raise InvalidStateTransitionError() from error
+        await self.repository.refresh(job)
+        await self.repository.refresh(run)
         return JobResult(job, run, False)
 
     async def list_jobs(

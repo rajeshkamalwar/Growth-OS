@@ -1,21 +1,26 @@
+import asyncio
 from collections.abc import AsyncIterator
-from uuid import uuid4
+from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import event, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from growth_os.db.base import Base
-from growth_os.db.models import ExecutionJob
+from growth_os.db.models import ExecutionJob, ExecutionRun
+from growth_os.execution import ALLOWED_TRANSITIONS, ExecutionStatus
 from growth_os.execution_repository import ExecutionRepository
 from growth_os.main import create_app
 from growth_os.repositories import TenantContext
 
 
 @pytest.fixture
-async def client() -> AsyncIterator[AsyncClient]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+async def session_factory(
+    tmp_path: Path,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'execution.db'}")
 
     @event.listens_for(engine.sync_engine, "connect")
     def enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
@@ -27,10 +32,17 @@ async def client() -> AsyncIterator[AsyncClient]:
         await connection.run_sync(Base.metadata.create_all)
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield session_factory
+    await engine.dispose()
+
+
+@pytest.fixture
+async def client(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncClient]:
     app = create_app(readiness_probe=_ready, session_factory=session_factory)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as api_client:
         yield api_client
-    await engine.dispose()
 
 
 async def _ready() -> None:
@@ -73,6 +85,50 @@ async def create_job(
     )
     assert response.status_code == 201
     return response.json()
+
+
+async def transition_job(
+    client: AsyncClient,
+    tenant: dict[str, object],
+    job: dict[str, object],
+    expected_status: ExecutionStatus,
+    target_status: ExecutionStatus,
+    *,
+    actor_id: str | None = None,
+) -> Response:
+    payload = {
+        "expected_status": expected_status.value,
+        "target_status": target_status.value,
+    }
+    if actor_id is not None:
+        payload["actor_id"] = actor_id
+    return await client.post(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}/transitions",
+        headers=headers(tenant),
+        json=payload,
+    )
+
+
+async def set_job_and_run_status(
+    session_factory: async_sessionmaker[AsyncSession],
+    tenant_id: object,
+    job_id: object,
+    status: ExecutionStatus,
+) -> None:
+    tenant_uuid = UUID(str(tenant_id))
+    job_uuid = UUID(str(job_id))
+    async with session_factory() as session:
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.tenant_id == tenant_uuid, ExecutionJob.id == job_uuid)
+            .values(status=status)
+        )
+        await session.execute(
+            update(ExecutionRun)
+            .where(ExecutionRun.tenant_id == tenant_uuid, ExecutionRun.job_id == job_uuid)
+            .values(status=status)
+        )
+        await session.commit()
 
 
 async def create_proposal(
@@ -326,3 +382,268 @@ async def test_rejection_and_audit_history_are_paginated(client: AsyncClient) ->
     assert body["pagination"]["total"] == 3
     assert len(body["items"]) == 2
     assert all(item["tenant_id"] == tenant["id"] for item in body["items"])
+
+
+@pytest.mark.parametrize(
+    ("expected_status", "target_status"),
+    [(expected, target) for expected, targets in ALLOWED_TRANSITIONS.items() for target in targets],
+)
+async def test_every_allowed_execution_edge_transitions_job_and_latest_run(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    expected_status: ExecutionStatus,
+    target_status: ExecutionStatus,
+) -> None:
+    tenant, workspace = await setup_tenant(client, f"{expected_status}-{target_status}")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], expected_status)
+
+    response = await transition_job(client, tenant, job, expected_status, target_status)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == target_status.value
+    assert response.json()["latest_run"]["status"] == target_status.value
+
+
+async def test_transition_records_exactly_one_audit_event_with_actor_and_run_details(
+    client: AsyncClient,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Audited Tenant")
+    job = await create_job(client, tenant, workspace)
+    actor_id = str(uuid4())
+
+    transitioned = await transition_job(
+        client,
+        tenant,
+        job,
+        ExecutionStatus.QUEUED,
+        ExecutionStatus.RUNNING,
+        actor_id=actor_id,
+    )
+    audit = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?limit=100&offset=0",
+        headers=headers(tenant),
+    )
+
+    assert transitioned.status_code == 200
+    transition_events = [
+        event
+        for event in audit.json()["items"]
+        if event["event_type"] == "execution_job.transitioned"
+    ]
+    assert len(transition_events) == 1
+    event = transition_events[0]
+    assert event["resource_id"] == job["id"]
+    assert event["actor_id"] == actor_id
+    assert event["details"] == {
+        "prior_status": "queued",
+        "target_status": "running",
+        "run_id": job["latest_run"]["id"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("expected_status", "target_status"),
+    [
+        (ExecutionStatus.QUEUED, ExecutionStatus.SUCCEEDED),
+        (ExecutionStatus.SUCCEEDED, ExecutionStatus.RUNNING),
+    ],
+)
+async def test_invalid_and_terminal_transitions_fail_without_an_audit_event(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    expected_status: ExecutionStatus,
+    target_status: ExecutionStatus,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Invalid Transition Tenant")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], expected_status)
+
+    response = await transition_job(client, tenant, job, expected_status, target_status)
+    audit = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?limit=100&offset=0",
+        headers=headers(tenant),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "invalid_state_transition"
+    assert all(
+        event["event_type"] != "execution_job.transitioned" for event in audit.json()["items"]
+    )
+
+
+async def test_stale_and_repeated_transition_attempts_fail_without_extra_audit(
+    client: AsyncClient,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Stale Tenant")
+    job = await create_job(client, tenant, workspace)
+
+    first = await transition_job(
+        client, tenant, job, ExecutionStatus.QUEUED, ExecutionStatus.RUNNING
+    )
+    repeated = await transition_job(
+        client, tenant, job, ExecutionStatus.QUEUED, ExecutionStatus.RUNNING
+    )
+    audit = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?limit=100&offset=0",
+        headers=headers(tenant),
+    )
+
+    assert first.status_code == 200
+    assert repeated.status_code == 409
+    assert repeated.json()["error"]["code"] == "invalid_state_transition"
+    assert (
+        sum(event["event_type"] == "execution_job.transitioned" for event in audit.json()["items"])
+        == 1
+    )
+
+
+async def test_two_competing_transitions_from_same_state_cannot_both_succeed(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Competing Tenant")
+    job = await create_job(client, tenant, workspace)
+    original_compare_and_set = ExecutionRepository.compare_and_set_job_status
+    both_callers_ready = asyncio.Event()
+    update_lock = asyncio.Lock()
+    callers = 0
+
+    async def synchronize_competing_callers(
+        repository: ExecutionRepository,
+        context: TenantContext,
+        job_id: UUID,
+        expected_status: ExecutionStatus,
+        target_status: ExecutionStatus,
+    ) -> bool:
+        nonlocal callers
+        callers += 1
+        if callers == 2:
+            both_callers_ready.set()
+        await both_callers_ready.wait()
+        async with update_lock:
+            return await original_compare_and_set(
+                repository, context, job_id, expected_status, target_status
+            )
+
+    monkeypatch.setattr(
+        ExecutionRepository, "compare_and_set_job_status", synchronize_competing_callers
+    )
+    responses = await asyncio.gather(
+        transition_job(client, tenant, job, ExecutionStatus.QUEUED, ExecutionStatus.RUNNING),
+        transition_job(client, tenant, job, ExecutionStatus.QUEUED, ExecutionStatus.CANCELLED),
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    loser = next(response for response in responses if response.status_code == 409)
+    assert loser.json()["error"]["code"] == "invalid_state_transition"
+    audit = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?limit=100&offset=0",
+        headers=headers(tenant),
+    )
+    assert (
+        sum(event["event_type"] == "execution_job.transitioned" for event in audit.json()["items"])
+        == 1
+    )
+
+
+async def test_inconsistent_job_and_latest_run_fails_closed(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Inconsistent Tenant")
+    job = await create_job(client, tenant, workspace)
+    async with session_factory() as session:
+        await session.execute(
+            update(ExecutionRun)
+            .where(ExecutionRun.id == UUID(str(job["latest_run"]["id"])))
+            .values(status=ExecutionStatus.RUNNING)
+        )
+        await session.commit()
+
+    response = await transition_job(
+        client, tenant, job, ExecutionStatus.QUEUED, ExecutionStatus.RUNNING
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "invalid_state_transition"
+    current = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}",
+        headers=headers(tenant),
+    )
+    assert current.json()["status"] == "queued"
+    assert current.json()["latest_run"]["status"] == "running"
+
+
+async def test_missing_and_cross_tenant_transition_requests_fail_safely(
+    client: AsyncClient,
+) -> None:
+    tenant_a, _ = await setup_tenant(client, "Tenant A Transition")
+    tenant_b, workspace_b = await setup_tenant(client, "Tenant B Transition")
+    job_b = await create_job(client, tenant_b, workspace_b)
+
+    missing = await client.post(
+        f"/api/v1/tenants/{tenant_a['id']}/execution-jobs/{uuid4()}/transitions",
+        headers=headers(tenant_a),
+        json={"expected_status": "queued", "target_status": "running"},
+    )
+    cross_tenant = await transition_job(
+        client, tenant_a, job_b, ExecutionStatus.QUEUED, ExecutionStatus.RUNNING
+    )
+
+    assert missing.status_code == 404
+    assert cross_tenant.status_code == 404
+    current = await client.get(
+        f"/api/v1/tenants/{tenant_b['id']}/execution-jobs/{job_b['id']}",
+        headers=headers(tenant_b),
+    )
+    assert current.json()["status"] == "queued"
+
+
+async def test_transition_request_is_strict(client: AsyncClient) -> None:
+    tenant, workspace = await setup_tenant(client, "Strict Tenant")
+    job = await create_job(client, tenant, workspace)
+
+    response = await client.post(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}/transitions",
+        headers=headers(tenant),
+        json={
+            "expected_status": "queued",
+            "target_status": "running",
+            "unexpected": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_run_compare_and_set_failure_rolls_back_job_and_audit(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Rollback Tenant")
+    job = await create_job(client, tenant, workspace)
+
+    async def lose_run_compare_and_set(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(ExecutionRepository, "compare_and_set_run_status", lose_run_compare_and_set)
+    response = await transition_job(
+        client, tenant, job, ExecutionStatus.QUEUED, ExecutionStatus.RUNNING
+    )
+
+    assert response.status_code == 409
+    current = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}",
+        headers=headers(tenant),
+    )
+    assert current.json()["status"] == "queued"
+    assert current.json()["latest_run"]["status"] == "queued"
+    audit = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?limit=100&offset=0",
+        headers=headers(tenant),
+    )
+    assert all(
+        event["event_type"] != "execution_job.transitioned" for event in audit.json()["items"]
+    )
