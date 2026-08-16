@@ -7,6 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from growth_os.api.errors import NotFoundError
 from growth_os.api.schemas import (
+    BusinessProfileCreate,
+    BusinessProfileResponse,
+    BusinessProfileUpdate,
     ConnectorStatusCreate,
     ConnectorStatusResponse,
     ConnectorStatusUpdate,
@@ -110,6 +113,46 @@ def create_foundation_router(
     ) -> object:
         return await service(session).update_owned(
             Workspace, context, resource_id, {"name": payload.name}
+        )
+
+    @router.post(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/business-profile",
+        response_model=BusinessProfileResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_business_profile(
+        workspace_id: UUID,
+        payload: BusinessProfileCreate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        values = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        return await service(session).create_business_profile(
+            context, workspace_id, values=values, actor_id=payload.actor_id
+        )
+
+    @router.get(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/business-profile",
+        response_model=BusinessProfileResponse,
+    )
+    async def get_business_profile(
+        workspace_id: UUID, context: Context, session: Session
+    ) -> object:
+        return await service(session).get_business_profile(context, workspace_id)
+
+    @router.patch(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/business-profile",
+        response_model=BusinessProfileResponse,
+    )
+    async def update_business_profile(
+        workspace_id: UUID,
+        payload: BusinessProfileUpdate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        changes = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        return await service(session).update_business_profile(
+            context, workspace_id, changes=changes, actor_id=payload.actor_id
         )
 
     @router.post(

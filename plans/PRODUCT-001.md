@@ -51,6 +51,8 @@ make dev
 
 # Focused and full tests
 .venv/bin/pytest tests/api/test_business_profiles.py tests/db/test_business_profile_constraints.py
+GROWTH_OS_TEST_DATABASE_URL='postgresql+asyncpg://<user>:<password>@<host>/<disposable-db>' \
+  .venv/bin/pytest tests/db/test_business_profile_constraints.py -k postgresql
 .venv/bin/pytest
 
 # Lint, formatting verification, and strict typing
@@ -63,7 +65,7 @@ make dev
 
 # Render migration SQL in both directions for review
 .venv/bin/alembic upgrade head --sql > /tmp/product-001-upgrade.sql
-.venv/bin/alembic downgrade 20260816_0002:head --sql > /tmp/product-001-downgrade.sql
+.venv/bin/alembic downgrade head:20260816_0002 --sql > /tmp/product-001-downgrade.sql
 
 # Apply and reverse the new revision only in a disposable development database
 .venv/bin/alembic upgrade head

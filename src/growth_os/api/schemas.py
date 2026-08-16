@@ -64,6 +64,46 @@ class WorkspaceResponse(AuditFields):
     name: str
 
 
+class BusinessProfileCreate(StrictInput):
+    company_name: str = Field(min_length=1, max_length=200)
+    business_description: str | None = Field(default=None, min_length=1, max_length=4000)
+    products_services: str | None = Field(default=None, min_length=1, max_length=4000)
+    target_audience: str | None = Field(default=None, min_length=1, max_length=4000)
+    positioning: str | None = Field(default=None, min_length=1, max_length=4000)
+    brand_voice: str | None = Field(default=None, min_length=1, max_length=4000)
+    actor_id: UUID | None = None
+
+
+class BusinessProfileUpdate(StrictInput):
+    company_name: str | None = Field(default=None, min_length=1, max_length=200)
+    business_description: str | None = Field(default=None, min_length=1, max_length=4000)
+    products_services: str | None = Field(default=None, min_length=1, max_length=4000)
+    target_audience: str | None = Field(default=None, min_length=1, max_length=4000)
+    positioning: str | None = Field(default=None, min_length=1, max_length=4000)
+    brand_voice: str | None = Field(default=None, min_length=1, max_length=4000)
+    actor_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def includes_profile_change(self) -> "BusinessProfileUpdate":
+        supplied = self.model_fields_set - {"actor_id"}
+        if not supplied:
+            raise ValueError("At least one profile field must be updated")
+        if "company_name" in supplied and self.company_name is None:
+            raise ValueError("Company name cannot be cleared")
+        return self
+
+
+class BusinessProfileResponse(AuditFields):
+    tenant_id: UUID
+    workspace_id: UUID
+    company_name: str
+    business_description: str | None
+    products_services: str | None
+    target_audience: str | None
+    positioning: str | None
+    brand_voice: str | None
+
+
 class MembershipCreate(StrictInput):
     workspace_id: UUID
     user_id: UUID

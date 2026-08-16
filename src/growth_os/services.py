@@ -5,7 +5,15 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 
 from growth_os.api.errors import ConflictError, NotFoundError
-from growth_os.db.models import Connector, Membership, Site, Tenant, Workspace
+from growth_os.db.models import (
+    AuditEvent,
+    Connector,
+    Membership,
+    Site,
+    Tenant,
+    Workspace,
+    WorkspaceBusinessProfile,
+)
 from growth_os.repositories import FoundationRepository, TenantContext
 
 Entity = TypeVar("Entity", Tenant, Workspace, Membership, Site, Connector)
@@ -110,6 +118,89 @@ class FoundationService:
         for field, value in changes.items():
             setattr(entity, field, value)
         return await self._persist(entity)
+
+    async def create_business_profile(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        values: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspaceBusinessProfile:
+        await self.get_owned(Workspace, context, workspace_id)
+        profile = WorkspaceBusinessProfile(
+            tenant_id=context.tenant_id, workspace_id=workspace_id, **values
+        )
+        audit = self._profile_audit(
+            profile,
+            "workspace_business_profile.created",
+            sorted(values),
+            actor_id,
+        )
+        self.repository.add(profile)
+        self.repository.add(audit)
+        return await self._persist_profile(profile)
+
+    async def get_business_profile(
+        self, context: TenantContext, workspace_id: UUID
+    ) -> WorkspaceBusinessProfile:
+        await self.get_owned(Workspace, context, workspace_id)
+        profile = await self.repository.get_business_profile(context, workspace_id)
+        if profile is None:
+            raise NotFoundError
+        return profile
+
+    async def update_business_profile(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        changes: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspaceBusinessProfile:
+        profile = await self.get_business_profile(context, workspace_id)
+        for field, value in changes.items():
+            setattr(profile, field, value)
+        self.repository.add(
+            self._profile_audit(
+                profile,
+                "workspace_business_profile.updated",
+                sorted(changes),
+                actor_id,
+            )
+        )
+        return await self._persist_profile(profile)
+
+    @staticmethod
+    def _profile_audit(
+        profile: WorkspaceBusinessProfile,
+        event_type: str,
+        changed_fields: list[str],
+        actor_id: UUID | None,
+    ) -> AuditEvent:
+        return AuditEvent(
+            tenant_id=profile.tenant_id,
+            event_type=event_type,
+            resource_type="workspace_business_profile",
+            resource_id=profile.id,
+            actor_id=actor_id,
+            details={
+                "workspace_id": str(profile.workspace_id),
+                "changed_fields": changed_fields,
+            },
+        )
+
+    async def _persist_profile(self, profile: WorkspaceBusinessProfile) -> WorkspaceBusinessProfile:
+        try:
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            raise ConflictError from error
+        except Exception:
+            await self.repository.rollback()
+            raise
+        await self.repository.refresh(profile)
+        return profile
 
     async def _persist(self, entity: Entity) -> Entity:
         self.repository.add(entity)
