@@ -131,6 +131,11 @@ class ExecutionTransitionCreate(StrictInput):
     actor_id: UUID | None = None
 
 
+class ExecutionRetryCreate(StrictInput):
+    expected_attempt_number: int = Field(ge=1)
+    actor_id: UUID | None = None
+
+
 class ExecutionRunResponse(AuditFields):
     tenant_id: UUID
     job_id: UUID

@@ -5,11 +5,12 @@ from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
-from sqlalchemy import event, update
+from sqlalchemy import event, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from growth_os.db.base import Base
-from growth_os.db.models import ExecutionJob, ExecutionRun
+from growth_os.db.models import AuditEvent, ExecutionJob, ExecutionRun
 from growth_os.execution import ALLOWED_TRANSITIONS, ExecutionStatus
 from growth_os.execution_repository import ExecutionRepository
 from growth_os.main import create_app
@@ -104,6 +105,24 @@ async def transition_job(
         payload["actor_id"] = actor_id
     return await client.post(
         f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}/transitions",
+        headers=headers(tenant),
+        json=payload,
+    )
+
+
+async def retry_job(
+    client: AsyncClient,
+    tenant: dict[str, object],
+    job: dict[str, object],
+    expected_attempt_number: int,
+    *,
+    actor_id: str | None = None,
+) -> Response:
+    payload: dict[str, object] = {"expected_attempt_number": expected_attempt_number}
+    if actor_id is not None:
+        payload["actor_id"] = actor_id
+    return await client.post(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}/retries",
         headers=headers(tenant),
         json=payload,
     )
@@ -647,3 +666,227 @@ async def test_run_compare_and_set_failure_rolls_back_job_and_audit(
     assert all(
         event["event_type"] != "execution_job.transitioned" for event in audit.json()["items"]
     )
+
+
+async def test_retry_reserves_next_attempt_preserves_history_and_records_audit(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Retry Tenant")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    actor_id = str(uuid4())
+
+    response = await retry_job(client, tenant, job, 1, actor_id=actor_id)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["latest_run"]["attempt_number"] == 2
+    assert body["latest_run"]["status"] == "queued"
+    assert body["latest_run"]["max_attempts"] == 3
+    assert body["latest_run"]["retry_delay_seconds"] == 0
+    assert body["latest_run"]["last_error_code"] is None
+    async with session_factory() as session:
+        runs = list(
+            (
+                await session.scalars(
+                    select(ExecutionRun)
+                    .where(ExecutionRun.job_id == UUID(str(job["id"])))
+                    .order_by(ExecutionRun.attempt_number)
+                )
+            ).all()
+        )
+    assert [(run.attempt_number, run.status) for run in runs] == [
+        (1, ExecutionStatus.FAILED),
+        (2, ExecutionStatus.QUEUED),
+    ]
+    audit = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/audit-events?limit=100&offset=0",
+        headers=headers(tenant),
+    )
+    events = [
+        event
+        for event in audit.json()["items"]
+        if event["event_type"] == "execution_job.retry_reserved"
+    ]
+    assert len(events) == 1
+    assert events[0]["actor_id"] == actor_id
+    assert events[0]["details"] == {
+        "prior_run_id": job["latest_run"]["id"],
+        "new_run_id": body["latest_run"]["id"],
+        "prior_attempt_number": 1,
+        "new_attempt_number": 2,
+    }
+
+
+@pytest.mark.parametrize("status", [ExecutionStatus.QUEUED, ExecutionStatus.RUNNING])
+async def test_retry_rejects_non_failed_state_without_side_effects(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    status: ExecutionStatus,
+) -> None:
+    tenant, workspace = await setup_tenant(client, f"Retry {status}")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], status)
+
+    response = await retry_job(client, tenant, job, 1)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "invalid_state_transition"
+
+
+async def test_retry_rejects_stale_repeated_and_exhausted_attempts(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Retry Bounds")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+
+    stale = await retry_job(client, tenant, job, 2)
+    first = await retry_job(client, tenant, job, 1)
+    repeated = await retry_job(client, tenant, job, 1)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    second = await retry_job(client, tenant, job, 2)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    exhausted = await retry_job(client, tenant, job, 3)
+
+    assert stale.status_code == 409
+    assert first.status_code == 200
+    assert repeated.status_code == 409
+    assert second.status_code == 200
+    assert exhausted.status_code == 409
+
+
+async def test_retry_is_strict_and_tenant_scoped(client: AsyncClient) -> None:
+    tenant_a, _ = await setup_tenant(client, "Retry Tenant A")
+    tenant_b, workspace_b = await setup_tenant(client, "Retry Tenant B")
+    job_b = await create_job(client, tenant_b, workspace_b)
+
+    strict = await client.post(
+        f"/api/v1/tenants/{tenant_b['id']}/execution-jobs/{job_b['id']}/retries",
+        headers=headers(tenant_b),
+        json={"expected_attempt_number": 1, "unexpected": True},
+    )
+    missing = await client.post(
+        f"/api/v1/tenants/{tenant_a['id']}/execution-jobs/{uuid4()}/retries",
+        headers=headers(tenant_a),
+        json={"expected_attempt_number": 1},
+    )
+    cross_tenant = await retry_job(client, tenant_a, job_b, 1)
+
+    assert strict.status_code == 422
+    assert missing.status_code == 404
+    assert cross_tenant.status_code == 404
+
+
+async def test_retry_insert_failure_rolls_back_job_and_audit(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Retry Rollback")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+
+    async def fail_insert(*_args: object, **_kwargs: object) -> ExecutionRun:
+        raise IntegrityError("insert", {}, Exception("forced"))
+
+    monkeypatch.setattr(ExecutionRepository, "insert_run", fail_insert)
+    response = await retry_job(client, tenant, job, 1)
+
+    assert response.status_code == 409
+    current = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/execution-jobs/{job['id']}",
+        headers=headers(tenant),
+    )
+    assert current.json()["status"] == "failed"
+    assert current.json()["latest_run"]["attempt_number"] == 1
+
+
+async def test_two_competing_retry_requests_cannot_both_succeed(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Competing Retries")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+    original_compare_and_set = ExecutionRepository.compare_and_set_job_status
+    both_callers_ready = asyncio.Event()
+    update_lock = asyncio.Lock()
+    callers = 0
+
+    async def synchronize_competing_callers(
+        repository: ExecutionRepository,
+        context: TenantContext,
+        job_id: UUID,
+        expected_status: ExecutionStatus,
+        target_status: ExecutionStatus,
+    ) -> bool:
+        nonlocal callers
+        callers += 1
+        if callers == 2:
+            both_callers_ready.set()
+        await both_callers_ready.wait()
+        async with update_lock:
+            return await original_compare_and_set(
+                repository, context, job_id, expected_status, target_status
+            )
+
+    monkeypatch.setattr(
+        ExecutionRepository, "compare_and_set_job_status", synchronize_competing_callers
+    )
+    responses = await asyncio.gather(
+        retry_job(client, tenant, job, 1),
+        retry_job(client, tenant, job, 1),
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    async with session_factory() as session:
+        run_count = len(
+            list(
+                (
+                    await session.scalars(
+                        select(ExecutionRun).where(ExecutionRun.job_id == UUID(str(job["id"])))
+                    )
+                ).all()
+            )
+        )
+    assert run_count == 2
+
+
+async def test_retry_commit_failure_rolls_back_run_job_and_audit(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Retry Commit Rollback")
+    job = await create_job(client, tenant, workspace)
+    await set_job_and_run_status(session_factory, tenant["id"], job["id"], ExecutionStatus.FAILED)
+
+    async def fail_commit(*_args: object, **_kwargs: object) -> None:
+        raise IntegrityError("commit", {}, Exception("forced"))
+
+    monkeypatch.setattr(ExecutionRepository, "commit", fail_commit)
+    response = await retry_job(client, tenant, job, 1)
+
+    assert response.status_code == 409
+    async with session_factory() as session:
+        current_job = await session.get(ExecutionJob, UUID(str(job["id"])))
+        runs = list(
+            (
+                await session.scalars(
+                    select(ExecutionRun).where(ExecutionRun.job_id == UUID(str(job["id"])))
+                )
+            ).all()
+        )
+        audit_count = await session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.event_type == "execution_job.retry_reserved")
+        )
+    assert current_job is not None and current_job.status is ExecutionStatus.FAILED
+    assert len(runs) == 1
+    assert audit_count == 0
