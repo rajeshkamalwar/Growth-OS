@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -368,11 +369,21 @@ async def test_job_list_filters_individually_and_composes_with_and_semantics(
 
 async def test_filtered_job_list_paginates_with_full_total_and_valid_empty_page(
     client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     tenant, workspace = await setup_tenant(client, "Filtered Pagination")
     first = await create_job(client, tenant, workspace, key="first-report", kind="report")
     second = await create_job(client, tenant, workspace, key="second-report", kind="report")
     await create_job(client, tenant, workspace, key="analysis", kind="analysis")
+
+    tied_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    async with session_factory() as session:
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.id.in_([UUID(str(first["id"])), UUID(str(second["id"]))]))
+            .values(created_at=tied_created_at)
+        )
+        await session.commit()
 
     first_page = await client.get(
         f"/api/v1/tenants/{tenant['id']}/execution-jobs?kind=report&limit=1&offset=0",
@@ -481,7 +492,24 @@ async def test_filtered_job_repository_is_tenant_safe_deterministic_and_read_onl
     await create_job(client, tenant_b, workspace_b, key="repo-foreign", kind="report")
     tenant_id = UUID(str(tenant_a["id"]))
 
+    first_id = UUID(str(first["id"]))
+    second_id = UUID(str(second["id"]))
+    ids_by_uuid = sorted([first_id, second_id], key=str)
+    lower_uuid_later_id, higher_uuid_earlier_id = ids_by_uuid
+    earlier_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+
     async with session_factory() as session:
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.id == higher_uuid_earlier_id)
+            .values(created_at=earlier_created_at)
+        )
+        await session.execute(
+            update(ExecutionJob)
+            .where(ExecutionJob.id == lower_uuid_later_id)
+            .values(created_at=earlier_created_at + timedelta(seconds=1))
+        )
+        await session.commit()
         repository = ExecutionRepository(session)
         before = (
             await session.scalar(select(func.count()).select_from(ExecutionJob)),
@@ -499,14 +527,7 @@ async def test_filtered_job_repository_is_tenant_safe_deterministic_and_read_onl
         )
 
     assert total == 2
-    ordered_ids = sorted(
-        [
-            UUID(str(first["id"])),
-            UUID(str(second["id"])),
-        ],
-        key=str,
-    )
-    assert [job.id for job, _run in jobs] == ordered_ids[1:]
+    assert [job.id for job, _run in jobs] == [lower_uuid_later_id]
     assert after == before
 
 
