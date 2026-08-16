@@ -1,35 +1,38 @@
 # Current Task
 
 ## Task ID
-FOUNDATION-010 (GitHub issue #24)
+FOUNDATION-011 (GitHub issue #26)
 
 ## Authorization
-Add a bounded, tenant-scoped read-only API for immutable execution-run history.
+Add bounded, tenant-safe filters to execution-job discovery.
 
 ## Goal
-Allow callers to inspect every attempt for a tenant-owned execution job without direct database
-access.
+Allow future workers and operators to narrow queued-work discovery without scanning every
+tenant-owned execution job or introducing execution behavior.
 
 ## Required Outcome
-- `GET /api/v1/tenants/{tenant_id}/execution-jobs/{job_id}/runs` returns the existing execution-run
-  response shape in the existing paginated collection contract.
-- The tenant-owned parent job is validated before its runs are queried.
-- Both items and total include only runs matching the tenant and job identifiers.
-- Results are ordered by attempt number ascending, then identifier, with bounded `limit` and
-  non-negative `offset` validation.
-- Missing and cross-tenant parent jobs remain indistinguishable as `not_found`.
+- `GET /api/v1/tenants/{tenant_id}/execution-jobs` accepts optional `workspace_id`, `status`, and
+  `kind` query filters while preserving the existing unfiltered response and pagination contract.
+- Supplied filters compose with logical AND and never replace the tenant predicate.
+- A supplied workspace must exist in the same tenant; missing and cross-tenant workspaces remain
+  indistinguishable as `not_found`.
+- Status uses the canonical execution enum and kind uses the existing bounded lowercase job-kind
+  identifier contract.
+- Page items and the independent total use identical filters and retain deterministic ordering,
+  bounded `limit`, and non-negative `offset`.
 - The operation performs no write or audit side effect.
 
 ## Constraints
 - Do not add or change database schema or migrations.
-- Do not create, update, transition, retry, delete, schedule, or execute jobs or runs.
+- Do not claim, lock, create, update, transition, retry, delete, schedule, or execute jobs or runs.
 - Do not change authentication, authorization, tenant isolation, billing, secrets, production
   infrastructure, or deployment behavior.
 
 ## Completion Gates
-- Deterministic API and repository tests cover ordering, pagination, totals, isolation, missing
-  parents, empty pages, validation, and read-only behavior.
-- Existing execution, proposal, approval, and audit behavior remains unchanged.
+- Deterministic API and repository tests cover individual filters, composition, ordering,
+  pagination, totals, tenant/workspace isolation, empty pages, validation, backward compatibility,
+  and read-only behavior.
+- Existing execution, retry, proposal, approval, run-history, and audit behavior remains unchanged.
 - Ruff format/lint, strict mypy, pytest, pip-audit, migration validation, and `git diff --check`
   pass.
 - A separate read-only reviewer reports zero blocking findings.
