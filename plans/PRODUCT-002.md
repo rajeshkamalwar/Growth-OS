@@ -92,7 +92,7 @@ approval, a verified backup, and a tested recovery plan. The new migration must 
 ## Affected Project Structure
 
 ```text
-docs/CURRENT-TASK.md                         active PRODUCT-002 authorization
+docs/CURRENT-TASK.md                         PLANNING-003 specification-correction authorization
 plans/PRODUCT-002.md                         this reviewed implementation specification
 README.md                                    primary-growth-goal endpoint and rollback guidance
 migrations/versions/<revision>_workspace_primary_growth_goals.py
