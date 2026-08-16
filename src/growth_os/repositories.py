@@ -13,6 +13,7 @@ from growth_os.db.models import (
     Tenant,
     Workspace,
     WorkspaceBusinessProfile,
+    WorkspacePrimaryGrowthGoal,
 )
 
 TenantOwned = TypeVar("TenantOwned", Workspace, Membership, Site, Connector)
@@ -78,6 +79,19 @@ class FoundationRepository:
                 select(WorkspaceBusinessProfile).where(
                     WorkspaceBusinessProfile.tenant_id == context.tenant_id,
                     WorkspaceBusinessProfile.workspace_id == workspace_id,
+                )
+            ),
+        )
+
+    async def get_primary_growth_goal(
+        self, context: TenantContext, workspace_id: UUID
+    ) -> WorkspacePrimaryGrowthGoal | None:
+        return cast(
+            WorkspacePrimaryGrowthGoal | None,
+            await self.session.scalar(
+                select(WorkspacePrimaryGrowthGoal).where(
+                    WorkspacePrimaryGrowthGoal.tenant_id == context.tenant_id,
+                    WorkspacePrimaryGrowthGoal.workspace_id == workspace_id,
                 )
             ),
         )

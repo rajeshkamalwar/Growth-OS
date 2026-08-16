@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -6,6 +6,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -98,6 +99,29 @@ class WorkspaceBusinessProfile(UUIDTimestampMixin, Base):
     target_audience: Mapped[str | None] = mapped_column(String(4000), nullable=True)
     positioning: Mapped[str | None] = mapped_column(String(4000), nullable=True)
     brand_voice: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+
+
+class WorkspacePrimaryGrowthGoal(UUIDTimestampMixin, Base):
+    __tablename__ = "workspace_primary_growth_goals"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "tenant_id"],
+            ["workspaces.id", "workspaces.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_workspace_primary_growth_goals_workspace_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "workspace_id",
+            name="uq_workspace_primary_growth_goals_tenant_workspace",
+        ),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(nullable=False)
+    workspace_id: Mapped[UUID] = mapped_column(nullable=False)
+    objective: Mapped[str] = mapped_column(String(2000), nullable=False)
+    success_definition: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
 
 class Membership(UUIDTimestampMixin, Base):

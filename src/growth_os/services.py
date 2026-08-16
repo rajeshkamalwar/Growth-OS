@@ -13,6 +13,7 @@ from growth_os.db.models import (
     Tenant,
     Workspace,
     WorkspaceBusinessProfile,
+    WorkspacePrimaryGrowthGoal,
 )
 from growth_os.repositories import FoundationRepository, TenantContext
 
@@ -170,6 +171,82 @@ class FoundationService:
             )
         )
         return await self._persist_profile(profile)
+
+    async def create_primary_growth_goal(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        values: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspacePrimaryGrowthGoal:
+        await self.get_owned(Workspace, context, workspace_id)
+        goal = WorkspacePrimaryGrowthGoal(
+            tenant_id=context.tenant_id, workspace_id=workspace_id, **values
+        )
+        self.repository.add(goal)
+        self.repository.add(
+            self._goal_audit(
+                goal, "workspace_primary_growth_goal.created", sorted(values), actor_id
+            )
+        )
+        return await self._persist_goal(goal)
+
+    async def get_primary_growth_goal(
+        self, context: TenantContext, workspace_id: UUID
+    ) -> WorkspacePrimaryGrowthGoal:
+        await self.get_owned(Workspace, context, workspace_id)
+        goal = await self.repository.get_primary_growth_goal(context, workspace_id)
+        if goal is None:
+            raise NotFoundError
+        return goal
+
+    async def update_primary_growth_goal(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        changes: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspacePrimaryGrowthGoal:
+        goal = await self.get_primary_growth_goal(context, workspace_id)
+        for field, value in changes.items():
+            setattr(goal, field, value)
+        self.repository.add(
+            self._goal_audit(
+                goal, "workspace_primary_growth_goal.updated", sorted(changes), actor_id
+            )
+        )
+        return await self._persist_goal(goal)
+
+    @staticmethod
+    def _goal_audit(
+        goal: WorkspacePrimaryGrowthGoal,
+        event_type: str,
+        changed_fields: list[str],
+        actor_id: UUID | None,
+    ) -> AuditEvent:
+        return AuditEvent(
+            tenant_id=goal.tenant_id,
+            event_type=event_type,
+            resource_type="workspace_primary_growth_goal",
+            resource_id=goal.id,
+            actor_id=actor_id,
+            details={"workspace_id": str(goal.workspace_id), "changed_fields": changed_fields},
+        )
+
+    async def _persist_goal(self, goal: WorkspacePrimaryGrowthGoal) -> WorkspacePrimaryGrowthGoal:
+        try:
+            await self.repository.flush()
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            raise ConflictError from error
+        except Exception:
+            await self.repository.rollback()
+            raise
+        await self.repository.refresh(goal)
+        return goal
 
     @staticmethod
     def _profile_audit(

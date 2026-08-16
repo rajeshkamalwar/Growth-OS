@@ -18,6 +18,9 @@ from growth_os.api.schemas import (
     MembershipUpdate,
     Page,
     Pagination,
+    PrimaryGrowthGoalCreate,
+    PrimaryGrowthGoalResponse,
+    PrimaryGrowthGoalUpdate,
     SiteCreate,
     SiteResponse,
     SiteUpdate,
@@ -152,6 +155,46 @@ def create_foundation_router(
     ) -> object:
         changes = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
         return await service(session).update_business_profile(
+            context, workspace_id, changes=changes, actor_id=payload.actor_id
+        )
+
+    @router.post(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/primary-growth-goal",
+        response_model=PrimaryGrowthGoalResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_primary_growth_goal(
+        workspace_id: UUID,
+        payload: PrimaryGrowthGoalCreate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        values = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        return await service(session).create_primary_growth_goal(
+            context, workspace_id, values=values, actor_id=payload.actor_id
+        )
+
+    @router.get(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/primary-growth-goal",
+        response_model=PrimaryGrowthGoalResponse,
+    )
+    async def get_primary_growth_goal(
+        workspace_id: UUID, context: Context, session: Session
+    ) -> object:
+        return await service(session).get_primary_growth_goal(context, workspace_id)
+
+    @router.patch(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/primary-growth-goal",
+        response_model=PrimaryGrowthGoalResponse,
+    )
+    async def update_primary_growth_goal(
+        workspace_id: UUID,
+        payload: PrimaryGrowthGoalUpdate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        changes = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        return await service(session).update_primary_growth_goal(
             context, workspace_id, changes=changes, actor_id=payload.actor_id
         )
 
