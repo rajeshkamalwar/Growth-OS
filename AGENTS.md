@@ -76,7 +76,29 @@ Implementation must follow architecture; architecture must not be rewritten mere
 - Spending money
 - Sending high-volume outreach
 - Deleting pages/data
-- Auto-merging or production deployment
+- Production deployment
+
+## Auto-Merge Policy
+Codex/Goal Orchestrator may automatically merge a development PR into `main` only when all
+of the following are true:
+
+1. The task is low or medium risk and is authorized by the active project goal or roadmap.
+2. The implementation is on a dedicated task branch.
+3. Lint, formatting, strict typing, tests, security/dependency checks, migration validation
+   where applicable, and `git diff --check` all pass locally.
+4. A separate reviewer pass finds no blocking issue; all findings are fixed and reverified,
+   and no unresolved review comments remain.
+5. The change is reversible and causes no production deployment or external customer-facing
+   side effect.
+
+Automatic merge must stop for authentication/authorization architecture, tenant isolation,
+billing, destructive migrations, secrets, production infrastructure or deployment, deleting
+meaningful data, spending money, publishing externally, social posting, website changes,
+outreach/email, backlink creation or outreach, third-party account modifications, material
+security tradeoffs, or anything explicitly classified high risk.
+
+This policy authorizes merge only. It does not authorize deployment or any otherwise gated
+external action.
 
 ## Definition of Done
 A task is not done because code was written. It is done only when its acceptance criteria are met, tests pass, evidence is provided, risks are documented, and a draft PR is ready for review.

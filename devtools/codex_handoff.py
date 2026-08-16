@@ -15,13 +15,16 @@ Safety properties:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, NotRequired, TextIO, TypedDict, cast
 
 REPO = os.environ.get("GROWTH_OS_REPO", "rajeshkamalwar/Growth-OS")
 OWNER = os.environ.get("GROWTH_OS_OWNER", "rajeshkamalwar")
@@ -32,13 +35,38 @@ FAILED_LABEL = "codex-failed"
 LOCK_FILE = Path(".git/codex-handoff.lock")
 STATUS_FILE = Path(".git/codex-handoff-status.json")
 LOG_DIR = Path(".git/codex-handoff-logs")
+DEFAULT_POLL_INTERVAL = 60
+MIN_POLL_INTERVAL = 5
+MAX_POLL_INTERVAL = 3600
+_LOCK_HANDLE: TextIO | None = None
+
+
+class IssueAuthor(TypedDict):
+    login: str
+
+
+class Issue(TypedDict):
+    number: int
+    title: str
+    body: NotRequired[str | None]
+    author: NotRequired[IssueAuthor | None]
+    url: NotRequired[str]
+
+
+class StatusContext(TypedDict):
+    issue: int
+    title: str
+    branch: str
+    started_at: str
 
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def run(*args: str, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run(
+    *args: str, input_text: str | None = None, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
         input=input_text,
@@ -48,7 +76,7 @@ def run(*args: str, input_text: str | None = None, check: bool = True) -> subpro
     )
 
 
-def gh_json(*args: str):
+def gh_json(*args: str) -> Any:
     result = run("gh", *args)
     return json.loads(result.stdout or "null")
 
@@ -70,7 +98,17 @@ def ensure_labels() -> None:
     }
     for name, description in labels.items():
         subprocess.run(
-            ["gh", "label", "create", name, "--repo", REPO, "--description", description, "--force"],
+            [
+                "gh",
+                "label",
+                "create",
+                name,
+                "--repo",
+                REPO,
+                "--description",
+                description,
+                "--force",
+            ],
             capture_output=True,
             text=True,
         )
@@ -79,17 +117,80 @@ def ensure_labels() -> None:
 def clean_tree_required() -> None:
     status = run("git", "status", "--porcelain").stdout.strip()
     if status:
-        raise RuntimeError("Working tree is not clean. Commit/stash changes before running the controller.")
+        raise RuntimeError(
+            "Working tree is not clean. Commit/stash changes before running the controller."
+        )
+
+
+def poll_interval(value: str) -> int:
+    """Parse a bounded polling interval from CLI or environment input."""
+    try:
+        interval = int(value)
+    except ValueError as exc:
+        raise ValueError("poll interval must be an integer number of seconds") from exc
+    if not MIN_POLL_INTERVAL <= interval <= MAX_POLL_INTERVAL:
+        raise ValueError(
+            f"poll interval must be between {MIN_POLL_INTERVAL} and {MAX_POLL_INTERVAL} seconds"
+        )
+    return interval
+
+
+def pid_is_running(pid: int) -> bool:
+    """Return whether a PID exists without sending it a signal."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def acquire_lock() -> None:
-    if LOCK_FILE.exists():
-        raise RuntimeError(f"Controller lock exists: {LOCK_FILE}")
-    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    """Acquire the single-controller lock, recovering stale lock files."""
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        raise RuntimeError("Controller lock is already held by this process")
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = LOCK_FILE.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        owner = lock.read().strip() or "unknown"
+        lock.close()
+        raise RuntimeError(f"Controller lock held by active controller PID {owner}") from None
+
+    lock.seek(0)
+    try:
+        existing_pid = int(lock.read().strip())
+    except ValueError:
+        existing_pid = -1
+    if existing_pid != os.getpid() and pid_is_running(existing_pid):
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+        raise RuntimeError(f"Controller lock held by active controller PID {existing_pid}")
+
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
+    os.fchmod(lock.fileno(), 0o600)
+    _LOCK_HANDLE = lock
 
 
 def release_lock() -> None:
-    LOCK_FILE.unlink(missing_ok=True)
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is None:
+        return
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    finally:
+        fcntl.flock(_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+        _LOCK_HANDLE.close()
+        _LOCK_HANDLE = None
 
 
 def write_status(
@@ -152,16 +253,26 @@ def show_status() -> int:
     return 0
 
 
-def next_issue() -> dict | None:
+def next_issue() -> Issue | None:
     issues = gh_json(
-        "issue", "list", "--repo", REPO,
-        "--state", "open", "--label", READY_LABEL,
-        "--limit", "1", "--json", "number,title,body,author,url"
+        "issue",
+        "list",
+        "--repo",
+        REPO,
+        "--state",
+        "open",
+        "--label",
+        READY_LABEL,
+        "--limit",
+        "1",
+        "--json",
+        "number,title,body,author,url",
     )
-    if not issues:
+    if not isinstance(issues, list) or not issues:
         return None
-    issue = issues[0]
-    author = ((issue.get("author") or {}).get("login") or "").lower()
+    issue = cast(Issue, issues[0])
+    author_data = issue.get("author")
+    author = (author_data.get("login") if author_data else "").lower()
     if author != OWNER.lower():
         raise RuntimeError(f"Refusing issue #{issue['number']}: author {author!r} is not {OWNER!r}")
     return issue
@@ -210,7 +321,7 @@ def reset_noop_branch(branch: str) -> None:
     subprocess.run(["git", "branch", "-D", branch], capture_output=True, text=True)
 
 
-def run_codex_stream(prompt: str, log_file: Path, status_context: dict[str, object]) -> tuple[int, str]:
+def run_codex_stream(prompt: str, log_file: Path, status_context: StatusContext) -> tuple[int, str]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     tail: list[str] = []
     with log_file.open("w", encoding="utf-8") as log:
@@ -237,14 +348,14 @@ def run_codex_stream(prompt: str, log_file: Path, status_context: dict[str, obje
     return return_code, "".join(tail)
 
 
-def process_issue(issue: dict) -> None:
+def process_issue(issue: Issue) -> None:
     number = int(issue["number"])
     title = issue["title"]
     body = issue.get("body") or ""
     branch = f"codex/issue-{number}-{slugify(title)}"
     started_at = now_iso()
     log_file = LOG_DIR / f"handoff-{number}.log"
-    status_context: dict[str, object] = {
+    status_context: StatusContext = {
         "issue": number,
         "title": title,
         "branch": branch,
@@ -274,13 +385,19 @@ Execution rules:
 - Do not merge, deploy, modify production, or weaken safety controls.
 - Run all relevant tests/checks before finishing.
 - Leave the working tree containing only justified task changes.
-- If the issue conflicts with source-of-truth docs or requires a stop/approval condition, stop and explain the exact conflict instead of bypassing it.
+- If the issue conflicts with source-of-truth docs or requires a stop/approval condition,
+  stop and explain the exact conflict instead of bypassing it.
 - Do NOT return a no-change result merely because related foundation code already exists.
-- A no-change result is allowed only if every acceptance criterion in the issue is already satisfied by the current repository state. If you believe that is true, you must verify each acceptance criterion with concrete repository evidence and relevant commands/tests before concluding no changes are required.
-- For implementation tasks, prefer making the necessary code/test/documentation changes over describing what could be changed.
+- A no-change result is allowed only if every acceptance criterion in the issue is already
+  satisfied by the current repository state. If you believe that is true, verify each criterion
+  with concrete repository evidence and relevant commands/tests before concluding no changes
+  are required.
+- For implementation tasks, prefer making the necessary code/test/documentation changes over
+  describing what could be changed.
 
 Completion expectation:
-Finish with a concise implementation summary covering files changed, architecture choices, checks run and results, acceptance-criteria status, risks/limitations, and rollback notes.
+Finish with a concise implementation summary covering files changed, architecture choices,
+checks run and results, acceptance-criteria status, risks/limitations, and rollback notes.
 """
 
     return_code, output_tail = run_codex_stream(prompt, log_file, status_context)
@@ -291,13 +408,16 @@ Finish with a concise implementation summary covering files changed, architectur
     if not changed:
         reset_noop_branch(branch)
         raise RuntimeError(
-            "Codex returned successfully but produced no repository changes for an implementation task. "
-            "The controller treats this as a failed handoff so the task can be reviewed/requeued instead "
+            "Codex returned successfully but produced no repository changes for an "
+            "implementation task. The controller treats this as a failed handoff so the task "
+            "can be reviewed/requeued instead "
             "of being falsely marked complete.\n\n"
             f"Codex output:\n{output_tail[-3000:]}"
         )
 
-    write_status("COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context)
+    write_status(
+        "COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context
+    )
     run("git", "add", "-A")
     run("git", "commit", "-m", f"codex: resolve issue #{number}")
 
@@ -310,14 +430,36 @@ Finish with a concise implementation summary covering files changed, architectur
         "It must be reviewed before merge. No production deployment is authorized."
     )
     pr_url = run(
-        "gh", "pr", "create", "--repo", REPO,
-        "--base", "main", "--head", branch, "--draft",
-        "--title", f"{title}", "--body", pr_body,
+        "gh",
+        "pr",
+        "create",
+        "--repo",
+        REPO,
+        "--base",
+        "main",
+        "--head",
+        branch,
+        "--draft",
+        "--title",
+        f"{title}",
+        "--body",
+        pr_body,
     ).stdout.strip()
 
-    write_status("PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context)
+    write_status(
+        "PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context
+    )
     comment(number, f"Codex completed and opened draft PR: {pr_url}")
     label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
+
+
+def record_issue_failure(issue: Issue, exc: BaseException) -> None:
+    """Persist and publish a terminal failure for the selected issue."""
+    number = int(issue["number"])
+    detail = str(exc)[-1000:]
+    write_status("FAILED", issue=number, title=issue.get("title"), detail=detail)
+    label(number, add=FAILED_LABEL, remove=RUNNING_LABEL)
+    comment(number, f"Local Codex controller failed:\n\n```text\n{str(exc)[-3000:]}\n```")
 
 
 def run_once() -> int:
@@ -335,27 +477,71 @@ def run_once() -> int:
             process_issue(issue)
             return 0
         except Exception as exc:
-            number = int(issue["number"])
-            write_status("FAILED", issue=number, title=issue.get("title"), detail=str(exc)[-1000:])
-            label(number, add=FAILED_LABEL, remove=RUNNING_LABEL)
-            comment(number, f"Local Codex controller failed:\n\n```text\n{str(exc)[-3000:]}\n```")
+            record_issue_failure(issue, exc)
             raise
+    finally:
+        release_lock()
+
+
+def run_watch(interval: int) -> int:
+    """Continuously process ready issues until interrupted or a task fails."""
+    ensure_tools()
+    ensure_labels()
+    acquire_lock()
+    try:
+        while True:
+            clean_tree_required()
+            issue = next_issue()
+            if issue is None:
+                write_status(
+                    "IDLE", detail=f"Watching for codex-ready issues every {interval} seconds"
+                )
+                time.sleep(interval)
+                continue
+            try:
+                process_issue(issue)
+            except KeyboardInterrupt:
+                record_issue_failure(
+                    issue, RuntimeError("Controller interrupted during task processing")
+                )
+                raise
+            except Exception as exc:
+                record_issue_failure(issue, exc)
+                raise
+    except KeyboardInterrupt:
+        write_status("STOPPED", detail="Controller stopped by operator")
+        return 0
     finally:
         release_lock()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Process at most one ready issue and exit")
-    parser.add_argument("--status", action="store_true", help="Show the latest local handoff status")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--once", action="store_true", help="Process at most one ready issue and exit"
+    )
+    modes.add_argument("--watch", action="store_true", help="Continuously watch for ready issues")
+    modes.add_argument("--status", action="store_true", help="Show the latest local handoff status")
+    parser.add_argument(
+        "--poll-interval",
+        type=poll_interval,
+        default=poll_interval(
+            os.environ.get("GROWTH_OS_POLL_INTERVAL", str(DEFAULT_POLL_INTERVAL))
+        ),
+        metavar="SECONDS",
+        help=f"Watch interval ({MIN_POLL_INTERVAL}-{MAX_POLL_INTERVAL}; default: %(default)s)",
+    )
     args = parser.parse_args()
 
     if args.status:
         return show_status()
-    if not args.once:
-        print("Use --once to process one ready issue or --status to inspect the latest handoff.")
+    if not args.once and not args.watch:
+        print("Use --once, --watch, or --status.")
         return 2
     try:
+        if args.watch:
+            return run_watch(args.poll_interval)
         return run_once()
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

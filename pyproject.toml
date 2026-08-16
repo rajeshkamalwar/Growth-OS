@@ -37,7 +37,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.ruff]
-extend-exclude = ["devtools"]
 line-length = 100
 target-version = "py312"
 
@@ -47,4 +46,4 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["growth_os"]
+files = ["src/growth_os", "devtools"]

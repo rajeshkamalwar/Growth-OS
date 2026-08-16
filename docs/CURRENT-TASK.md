@@ -1,31 +1,36 @@
 # Current Task
 
 ## Task ID
-FOUNDATION-004 (GitHub issue #9)
+FOUNDATION-005 (GitHub issue #11)
 
 ## Authorization
-Build the tenant-safe internal execution/control layer on FOUNDATION-003.
+Make the local development handoff controller persistently watch for authorized work.
 
 ## Goal
-Add execution jobs/runs, inert action proposals, approval decisions, bounded retries,
-idempotency, and an audit trail without performing external actions.
+Extend `devtools/codex_handoff.py` with a bounded `--watch` mode while preserving `--once`
+and `--status`.
 
 ## Required Outcome
-- Execution and proposal state is explicit and terminal transitions are guarded.
-- Every execution request is idempotent within its tenant.
-- Approval decisions are append-only, tenant-safe, and final.
-- High-risk proposed actions cannot bypass explicit human approval.
-- Meaningful execution and decision changes create tenant-scoped audit events.
-- Control-plane list APIs preserve bounded pagination and structured errors.
+- Watch mode polls continuously at a configurable interval bounded from 5 to 3600 seconds.
+- Ctrl-C stops cleanly, records stopped status, and releases the controller lock.
+- A live controller lock rejects a second controller; stale or malformed locks recover safely.
+- A task failure is recorded and stops the controller before another issue is selected.
+- Existing one-shot and status modes remain available.
+- The bounded auto-merge policy is recorded, while reviewer/fix/merge automation remains a
+  later milestone.
 
 ## Constraints
-- Do not add an executor, scheduler, connector, agent, LLM, n8n, or Temporal integration.
-- Do not change tenant-context or authentication architecture.
-- Do not perform external actions or production side effects.
+- Do not install or configure an operating-system service in this milestone.
+- Do not implement automatic review or merge in this milestone.
+- Do not change authentication, tenant isolation, billing, production infrastructure, or
+  deployment behavior.
+- Do not perform product or customer-facing external actions.
 - Follow `AGENTS.md` and the repository source-of-truth documents.
 
 ## Completion Gates
 - Ruff format/lint, strict mypy, pytest, pip-audit, migration validation, and
   `git diff --check` pass where available.
-- Existing health/readiness and FOUNDATION-003 APIs remain intact.
+- Controller behavior has deterministic tests with subprocess, GitHub, and sleep boundaries
+  mocked.
+- Existing application APIs remain intact.
 - Work is delivered from a task branch through a draft pull request.
