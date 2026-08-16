@@ -5,7 +5,14 @@ from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from growth_os.db.base import Base
-from growth_os.db.models import ActionProposal, AuditEvent, ExecutionJob, ExecutionRun
+from growth_os.db.models import (
+    ActionProposal,
+    AuditEvent,
+    ExecutionJob,
+    ExecutionRun,
+    ProposalStatus,
+    RiskLevel,
+)
 from growth_os.execution import ExecutionStatus
 from growth_os.repositories import TenantContext
 
@@ -210,6 +217,42 @@ class ExecutionRepository:
         )
         total = await self.session.scalar(select(func.count()).select_from(model).where(predicate))
         return items, total or 0
+
+    async def list_proposals(
+        self,
+        context: TenantContext,
+        *,
+        job_id: UUID | None = None,
+        status: ProposalStatus | None = None,
+        risk_level: RiskLevel | None = None,
+        requires_approval: bool | None = None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[ActionProposal], int]:
+        predicate = [ActionProposal.tenant_id == context.tenant_id]
+        if job_id is not None:
+            predicate.append(ActionProposal.job_id == job_id)
+        if status is not None:
+            predicate.append(ActionProposal.status == status)
+        if risk_level is not None:
+            predicate.append(ActionProposal.risk_level == risk_level)
+        if requires_approval is not None:
+            predicate.append(ActionProposal.requires_approval == requires_approval)
+        proposals = list(
+            (
+                await self.session.scalars(
+                    select(ActionProposal)
+                    .where(*predicate)
+                    .order_by(ActionProposal.created_at, ActionProposal.id)
+                    .limit(limit)
+                    .offset(offset)
+                )
+            ).all()
+        )
+        total = await self.session.scalar(
+            select(func.count()).select_from(ActionProposal).where(*predicate)
+        )
+        return proposals, total or 0
 
     async def list_audit_events(
         self,

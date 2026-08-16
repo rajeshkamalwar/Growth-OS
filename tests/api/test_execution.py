@@ -11,9 +11,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from growth_os.db.base import Base
-from growth_os.db.models import AuditEvent, ExecutionJob, ExecutionRun
+from growth_os.db.models import (
+    ActionProposal,
+    AuditEvent,
+    ExecutionJob,
+    ExecutionRun,
+    ProposalStatus,
+    RiskLevel,
+)
 from growth_os.execution import ALLOWED_TRANSITIONS, ExecutionStatus
 from growth_os.execution_repository import ExecutionRepository
+from growth_os.execution_service import ExecutionService
 from growth_os.main import create_app
 from growth_os.repositories import TenantContext
 
@@ -173,16 +181,18 @@ async def create_proposal(
     job: dict[str, object],
     *,
     risk_level: str = "high",
+    requires_approval: bool = True,
+    action_type: str = "website_change",
 ) -> dict[str, object]:
     response = await client.post(
         f"/api/v1/tenants/{tenant['id']}/action-proposals",
         headers=headers(tenant),
         json={
             "job_id": job["id"],
-            "action_type": "website_change",
+            "action_type": action_type,
             "description": "Change the home page title",
             "risk_level": risk_level,
-            "requires_approval": True,
+            "requires_approval": requires_approval,
         },
     )
     assert response.status_code == 201
@@ -322,6 +332,236 @@ async def test_job_and_proposal_lists_are_tenant_scoped(client: AsyncClient) -> 
     assert [item["id"] for item in jobs_response.json()["items"]] == [job_a["id"]]
     assert proposals_response.status_code == 200
     assert [item["id"] for item in proposals_response.json()["items"]] == [proposal_a["id"]]
+
+
+async def test_proposal_filters_work_independently_and_compose_with_and(
+    client: AsyncClient,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Filtered Proposals")
+    first_job = await create_job(client, tenant, workspace, key="proposal-filter-first")
+    second_job = await create_job(client, tenant, workspace, key="proposal-filter-second")
+    awaiting_high = await create_proposal(client, tenant, first_job, action_type="high_change")
+    awaiting_medium = await create_proposal(
+        client,
+        tenant,
+        first_job,
+        risk_level="medium",
+        action_type="medium_change",
+    )
+    approved_read = await create_proposal(
+        client,
+        tenant,
+        second_job,
+        risk_level="read_only",
+        requires_approval=False,
+        action_type="inspect_site",
+    )
+
+    base_url = f"/api/v1/tenants/{tenant['id']}/action-proposals"
+    by_job = await client.get(f"{base_url}?job_id={first_job['id']}", headers=headers(tenant))
+    by_status = await client.get(f"{base_url}?status=approved", headers=headers(tenant))
+    by_risk = await client.get(f"{base_url}?risk_level=high", headers=headers(tenant))
+    by_approval = await client.get(f"{base_url}?requires_approval=false", headers=headers(tenant))
+    composed = await client.get(
+        f"{base_url}?job_id={first_job['id']}&status=awaiting_approval"
+        "&risk_level=medium&requires_approval=true",
+        headers=headers(tenant),
+    )
+
+    assert {item["id"] for item in by_job.json()["items"]} == {
+        awaiting_high["id"],
+        awaiting_medium["id"],
+    }
+    assert by_job.json()["pagination"]["total"] == 2
+    assert [item["id"] for item in by_status.json()["items"]] == [approved_read["id"]]
+    assert [item["id"] for item in by_risk.json()["items"]] == [awaiting_high["id"]]
+    assert [item["id"] for item in by_approval.json()["items"]] == [approved_read["id"]]
+    assert [item["id"] for item in composed.json()["items"]] == [awaiting_medium["id"]]
+    assert composed.json()["pagination"]["total"] == 1
+
+
+async def test_filtered_proposals_have_stable_pages_full_totals_and_empty_results(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Paged Proposals")
+    job = await create_job(client, tenant, workspace, key="paged-proposals")
+    first = await create_proposal(client, tenant, job, risk_level="low", action_type="first")
+    second = await create_proposal(client, tenant, job, risk_level="low", action_type="second")
+    tied_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    async with session_factory() as session:
+        await session.execute(
+            update(ActionProposal)
+            .where(ActionProposal.id.in_([UUID(str(first["id"])), UUID(str(second["id"]))]))
+            .values(created_at=tied_created_at)
+        )
+        await session.commit()
+
+    base_url = f"/api/v1/tenants/{tenant['id']}/action-proposals?risk_level=low&limit=1"
+    first_page = await client.get(f"{base_url}&offset=0", headers=headers(tenant))
+    second_page = await client.get(f"{base_url}&offset=1", headers=headers(tenant))
+    empty_page = await client.get(f"{base_url}&offset=2", headers=headers(tenant))
+    unknown = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/action-proposals"
+        "?status=rejected&risk_level=read_only&requires_approval=true",
+        headers=headers(tenant),
+    )
+
+    ordered_ids = sorted(
+        [item["id"] for item in first_page.json()["items"] + second_page.json()["items"]]
+    )
+    assert [item["id"] for item in first_page.json()["items"]] == ordered_ids[:1]
+    assert [item["id"] for item in second_page.json()["items"]] == ordered_ids[1:]
+    assert first_page.json()["pagination"]["total"] == 2
+    assert empty_page.json() == {
+        "items": [],
+        "pagination": {"limit": 1, "offset": 2, "total": 2},
+    }
+    assert unknown.json() == {
+        "items": [],
+        "pagination": {"limit": 50, "offset": 0, "total": 0},
+    }
+
+
+async def test_proposal_job_filter_hides_missing_and_cross_tenant_jobs(
+    client: AsyncClient,
+) -> None:
+    tenant_a, _workspace_a = await setup_tenant(client, "Proposal Filter Tenant A")
+    tenant_b, workspace_b = await setup_tenant(client, "Proposal Filter Tenant B")
+    job_b = await create_job(client, tenant_b, workspace_b, key="cross-proposal-filter")
+    await create_proposal(client, tenant_b, job_b)
+    base_url = f"/api/v1/tenants/{tenant_a['id']}/action-proposals"
+
+    missing = await client.get(f"{base_url}?job_id={uuid4()}", headers=headers(tenant_a))
+    cross_tenant = await client.get(f"{base_url}?job_id={job_b['id']}", headers=headers(tenant_a))
+
+    assert missing.status_code == cross_tenant.status_code == 404
+    assert missing.json()["error"]["code"] == "not_found"
+    assert cross_tenant.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "job_id=not-a-uuid",
+        "status=unknown",
+        "risk_level=unknown",
+        "requires_approval=not-a-boolean",
+        "limit=0",
+        "limit=101",
+        "offset=-1",
+    ],
+)
+async def test_proposal_filters_retain_structured_validation_errors(
+    client: AsyncClient, query: str
+) -> None:
+    tenant, _workspace = await setup_tenant(client, f"Invalid proposal filter {query}")
+
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/action-proposals?{query}", headers=headers(tenant)
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_filtered_proposal_repository_is_tenant_safe_and_read_only(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant_a, workspace_a = await setup_tenant(client, "Proposal Repository Tenant A")
+    tenant_b, workspace_b = await setup_tenant(client, "Proposal Repository Tenant B")
+    job_a = await create_job(client, tenant_a, workspace_a, key="repository-proposal-a")
+    job_b = await create_job(client, tenant_b, workspace_b, key="repository-proposal-b")
+    proposal_a = await create_proposal(client, tenant_a, job_a, risk_level="medium")
+    await create_proposal(client, tenant_b, job_b, risk_level="medium")
+
+    async with session_factory() as session:
+        repository = ExecutionRepository(session)
+        before = (
+            await session.scalar(select(func.count()).select_from(ActionProposal)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+        proposals, total = await repository.list_proposals(
+            TenantContext(tenant_id=UUID(str(tenant_a["id"]))),
+            job_id=UUID(str(job_a["id"])),
+            status=ProposalStatus.AWAITING_APPROVAL,
+            risk_level=RiskLevel.MEDIUM,
+            requires_approval=True,
+            limit=1,
+            offset=0,
+        )
+        after = (
+            await session.scalar(select(func.count()).select_from(ActionProposal)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+
+    assert total == 1
+    assert [str(proposal.id) for proposal in proposals] == [proposal_a["id"]]
+    assert after == before
+
+
+async def test_proposal_listing_routes_through_execution_service(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Proposal Service Routing")
+    job = await create_job(client, tenant, workspace, key="proposal-service-routing")
+    proposal = await create_proposal(client, tenant, job)
+    original = ExecutionService.list_proposals
+    called = False
+
+    async def tracked_list(
+        execution_service: ExecutionService,
+        context: TenantContext,
+        **filters: object,
+    ) -> tuple[list[ActionProposal], int]:
+        nonlocal called
+        called = True
+        return await original(execution_service, context, **filters)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ExecutionService, "list_proposals", tracked_list)
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/action-proposals", headers=headers(tenant)
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [proposal["id"]]
+    assert called
+
+
+async def test_unfiltered_proposal_listing_remains_ordered_and_read_only(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tenant, workspace = await setup_tenant(client, "Unfiltered Proposals")
+    job = await create_job(client, tenant, workspace, key="unfiltered-proposals")
+    first = await create_proposal(client, tenant, job, action_type="unfiltered_first")
+    second = await create_proposal(client, tenant, job, action_type="unfiltered_second")
+    async with session_factory() as session:
+        before = (
+            await session.scalar(select(func.count()).select_from(ActionProposal)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+
+    response = await client.get(
+        f"/api/v1/tenants/{tenant['id']}/action-proposals", headers=headers(tenant)
+    )
+
+    async with session_factory() as session:
+        after = (
+            await session.scalar(select(func.count()).select_from(ActionProposal)),
+            await session.scalar(select(func.count()).select_from(AuditEvent)),
+        )
+    body = response.json()
+    expected_ids = [
+        proposal["id"]
+        for proposal in sorted([first, second], key=lambda item: (item["created_at"], item["id"]))
+    ]
+    assert response.status_code == 200
+    assert [item["id"] for item in body["items"]] == expected_ids
+    assert body["pagination"] == {"limit": 50, "offset": 0, "total": 2}
+    assert after == before
 
 
 async def test_job_list_filters_individually_and_composes_with_and_semantics(

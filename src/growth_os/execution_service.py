@@ -242,6 +242,29 @@ class ExecutionService:
         await self.get_owned(ExecutionJob, context, job_id)
         return await self.repository.list_runs(context, job_id, limit=limit, offset=offset)
 
+    async def list_proposals(
+        self,
+        context: TenantContext,
+        *,
+        job_id: UUID | None = None,
+        status: ProposalStatus | None = None,
+        risk_level: RiskLevel | None = None,
+        requires_approval: bool | None = None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[ActionProposal], int]:
+        if job_id is not None:
+            await self.get_owned(ExecutionJob, context, job_id)
+        return await self.repository.list_proposals(
+            context,
+            job_id=job_id,
+            status=status,
+            risk_level=risk_level,
+            requires_approval=requires_approval,
+            limit=limit,
+            offset=offset,
+        )
+
     async def create_proposal(
         self,
         context: TenantContext,
