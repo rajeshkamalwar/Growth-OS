@@ -1,36 +1,39 @@
 # Current Task
 
 ## Task ID
-FOUNDATION-012 (GitHub issue #28)
+FOUNDATION-013 (GitHub issue #30)
 
 ## Authorization
-Add bounded, tenant-safe filters to audit-ledger retrieval.
+Add bounded, tenant-safe filters to action-proposal discovery.
 
 ## Goal
-Allow operators and future agents to trace specific audit events without scanning an entire
-tenant ledger or introducing any write behavior.
+Allow operators and future approval workflows to discover pending or risk-scoped proposals
+without scanning every proposal or introducing any write behavior.
 
 ## Required Outcome
-- `GET /api/v1/tenants/{tenant_id}/audit-events` accepts optional `event_type`, `resource_type`,
-  `resource_id`, and `actor_id` filters while preserving the unfiltered response and pagination
-  contract.
+- `GET /api/v1/tenants/{tenant_id}/action-proposals` accepts optional `job_id`, `status`,
+  `risk_level`, and `requires_approval` filters while preserving the unfiltered response and
+  pagination contract.
 - Supplied filters compose with logical AND and never replace the tenant predicate.
-- Event and resource types use bounded, non-empty lowercase identifiers matching stored dotted and
-  underscored conventions; resource and actor identifiers use UUID validation.
+- A supplied job identifier must resolve through the same-tenant execution boundary; missing and
+  cross-tenant jobs both return `not_found`.
+- Status and risk use the canonical proposal enums, while job identifiers and approval flags use
+  FastAPI/Pydantic UUID and boolean parsing.
 - Page items and the independent total use identical filters and retain deterministic ordering,
   bounded `limit`, and non-negative `offset`.
-- The operation performs no write or audit side effect.
+- Listing routes through the execution service/repository boundary and performs no write or audit
+  side effect.
 
 ## Constraints
 - Do not add or change database schema or migrations.
-- Do not resolve referenced resources or create, update, delete, aggregate, or report audit events.
+- Do not create, decide, transition, execute, or delete proposals or jobs.
 - Do not change authentication, authorization, tenant isolation, billing, secrets, production
   infrastructure, or deployment behavior.
 
 ## Completion Gates
-- Deterministic API and repository tests cover individual filters, composition, ordering,
-  pagination, totals, tenant isolation, identifier collisions, empty pages, validation, backward
-  compatibility, and read-only behavior.
+- Deterministic API, repository, and service-routing tests cover individual filters, composition,
+  ordering, pagination, totals, tenant isolation, empty pages, validation, backward compatibility,
+  parent-job ownership, and read-only behavior.
 - Existing execution, retry, proposal, approval, run-history, and audit behavior remains unchanged.
 - Ruff format/lint, strict mypy, pytest, pip-audit, migration validation, and `git diff --check`
   pass.

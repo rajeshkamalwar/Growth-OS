@@ -20,7 +20,7 @@ from growth_os.api.schemas import (
     Page,
     Pagination,
 )
-from growth_os.db.models import ActionProposal
+from growth_os.db.models import ActionProposal, ProposalStatus, RiskLevel
 from growth_os.execution import ExecutionStatus
 from growth_os.execution_repository import ExecutionRepository
 from growth_os.execution_service import ExecutionService, JobResult
@@ -200,10 +200,23 @@ def create_execution_router(session_factory: async_sessionmaker[AsyncSession]) -
         "/tenants/{tenant_id}/action-proposals", response_model=Page[ActionProposalResponse]
     )
     async def list_proposals(
-        context: Context, session: Session, limit: Limit = 50, offset: Offset = 0
+        context: Context,
+        session: Session,
+        job_id: UUID | None = None,
+        status: ProposalStatus | None = None,
+        risk_level: RiskLevel | None = None,
+        requires_approval: bool | None = None,
+        limit: Limit = 50,
+        offset: Offset = 0,
     ) -> Page[ActionProposalResponse]:
-        proposals, total = await service(session).repository.list_owned(
-            ActionProposal, context, limit=limit, offset=offset
+        proposals, total = await service(session).list_proposals(
+            context,
+            job_id=job_id,
+            status=status,
+            risk_level=risk_level,
+            requires_approval=requires_approval,
+            limit=limit,
+            offset=offset,
         )
         return page(
             [ActionProposalResponse.model_validate(item) for item in proposals],
