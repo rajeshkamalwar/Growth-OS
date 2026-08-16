@@ -176,3 +176,17 @@ def test_watch_records_issue_failure_and_stops_before_next_task(
     assert next_calls == 1
     assert labels == [(11, codex_handoff.FAILED_LABEL, codex_handoff.RUNNING_LABEL)]
     assert "implementation failed" in comments[0]
+
+
+def test_run_once_preserves_idle_behavior_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, status_file = runtime_paths
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    monkeypatch.setattr(codex_handoff, "clean_tree_required", lambda: None)
+    monkeypatch.setattr(codex_handoff, "next_issue", lambda: None)
+
+    assert codex_handoff.run_once() == 0
+    assert not lock_file.exists()
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "IDLE"
