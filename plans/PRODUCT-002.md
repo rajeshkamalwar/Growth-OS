@@ -429,9 +429,8 @@ Only in a disposable development database, downgrade one revision to drop
 goal data. Before any approved downgrade against meaningful shared or production data, obtain
 explicit approval, take and verify a backup, and document and test recovery.
 
-PLANNING-002 itself is documentation-only. Revert its planning commit to remove this unimplemented
-specification and restore PRODUCT-001 as the recorded current task; it has no runtime, schema,
-production, or external rollback.
+PLANNING-003 is a documentation-only correction. Revert the PLANNING-003 correction commit to
+restore the prior documentation; it has no runtime, schema, data, production, or external effect.
 
 ## Open Questions
 
