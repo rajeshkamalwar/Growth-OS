@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 from collections.abc import Iterator
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,12 @@ MODULE_SPEC = importlib.util.spec_from_file_location("codex_handoff", MODULE_PAT
 assert MODULE_SPEC is not None and MODULE_SPEC.loader is not None
 codex_handoff = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(codex_handoff)
+
+
+def test_now_iso_records_an_explicit_utc_offset() -> None:
+    timestamp = datetime.fromisoformat(codex_handoff.now_iso())
+
+    assert timestamp.utcoffset() == timedelta(0)
 
 
 @pytest.fixture
