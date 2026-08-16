@@ -56,3 +56,10 @@ read-only Codex review whose schema-constrained output is treated as untrusted a
 Actionable findings may trigger at most two workspace-write fix rounds, each fully reverified.
 The controller fails closed on malformed output, failed gates, no-change fixes, or exhausted
 rounds, and still stops at a draft PR; automatic merge remains a separate milestone.
+
+## D-017 — Development auto-merge is explicit, deterministic, and fail-closed
+The local controller may squash-merge an exact independently reviewed head only when an
+owner-authored structured assessment and trusted controller checks satisfy D-014. It does not
+infer permission from model prose. Missing or invalid assessment data, protected paths, stale PR
+metadata, blocking reviews, unresolved threads, or head movement leave the reviewed PR open for
+human handling. Merge never authorizes deployment or any external product action.
