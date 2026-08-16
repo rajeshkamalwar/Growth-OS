@@ -12,6 +12,7 @@ from growth_os.db.models import (
     Site,
     Tenant,
     Workspace,
+    WorkspaceAutonomyPolicy,
     WorkspaceBusinessProfile,
     WorkspacePrimaryGrowthGoal,
 )
@@ -92,6 +93,19 @@ class FoundationRepository:
                 select(WorkspacePrimaryGrowthGoal).where(
                     WorkspacePrimaryGrowthGoal.tenant_id == context.tenant_id,
                     WorkspacePrimaryGrowthGoal.workspace_id == workspace_id,
+                )
+            ),
+        )
+
+    async def get_autonomy_policy(
+        self, context: TenantContext, workspace_id: UUID
+    ) -> WorkspaceAutonomyPolicy | None:
+        return cast(
+            WorkspaceAutonomyPolicy | None,
+            await self.session.scalar(
+                select(WorkspaceAutonomyPolicy).where(
+                    WorkspaceAutonomyPolicy.tenant_id == context.tenant_id,
+                    WorkspaceAutonomyPolicy.workspace_id == workspace_id,
                 )
             ),
         )

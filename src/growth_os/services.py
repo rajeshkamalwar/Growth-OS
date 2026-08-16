@@ -12,6 +12,7 @@ from growth_os.db.models import (
     Site,
     Tenant,
     Workspace,
+    WorkspaceAutonomyPolicy,
     WorkspaceBusinessProfile,
     WorkspacePrimaryGrowthGoal,
 )
@@ -218,6 +219,87 @@ class FoundationService:
             )
         )
         return await self._persist_goal(goal)
+
+    async def create_autonomy_policy(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        values: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspaceAutonomyPolicy:
+        await self.get_owned(Workspace, context, workspace_id)
+        policy = WorkspaceAutonomyPolicy(
+            tenant_id=context.tenant_id, workspace_id=workspace_id, **values
+        )
+        self.repository.add(policy)
+        self.repository.add(
+            self._autonomy_policy_audit(
+                policy, "workspace_autonomy_policy.created", sorted(values), actor_id
+            )
+        )
+        return await self._persist_autonomy_policy(policy)
+
+    async def get_autonomy_policy(
+        self, context: TenantContext, workspace_id: UUID
+    ) -> WorkspaceAutonomyPolicy:
+        await self.get_owned(Workspace, context, workspace_id)
+        policy = await self.repository.get_autonomy_policy(context, workspace_id)
+        if policy is None:
+            raise NotFoundError
+        return policy
+
+    async def update_autonomy_policy(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        changes: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspaceAutonomyPolicy:
+        policy = await self.get_autonomy_policy(context, workspace_id)
+        for field, value in changes.items():
+            setattr(policy, field, value)
+        self.repository.add(
+            self._autonomy_policy_audit(
+                policy, "workspace_autonomy_policy.updated", sorted(changes), actor_id
+            )
+        )
+        return await self._persist_autonomy_policy(policy)
+
+    @staticmethod
+    def _autonomy_policy_audit(
+        policy: WorkspaceAutonomyPolicy,
+        event_type: str,
+        changed_fields: list[str],
+        actor_id: UUID | None,
+    ) -> AuditEvent:
+        return AuditEvent(
+            tenant_id=policy.tenant_id,
+            event_type=event_type,
+            resource_type="workspace_autonomy_policy",
+            resource_id=policy.id,
+            actor_id=actor_id,
+            details={
+                "workspace_id": str(policy.workspace_id),
+                "changed_fields": changed_fields,
+            },
+        )
+
+    async def _persist_autonomy_policy(
+        self, policy: WorkspaceAutonomyPolicy
+    ) -> WorkspaceAutonomyPolicy:
+        try:
+            await self.repository.flush()
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            raise ConflictError from error
+        except Exception:
+            await self.repository.rollback()
+            raise
+        await self.repository.refresh(policy)
+        return policy
 
     @staticmethod
     def _goal_audit(

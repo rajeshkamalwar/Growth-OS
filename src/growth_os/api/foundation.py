@@ -7,6 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from growth_os.api.errors import NotFoundError
 from growth_os.api.schemas import (
+    AutonomyPolicyCreate,
+    AutonomyPolicyResponse,
+    AutonomyPolicyUpdate,
     BusinessProfileCreate,
     BusinessProfileResponse,
     BusinessProfileUpdate,
@@ -195,6 +198,44 @@ def create_foundation_router(
     ) -> object:
         changes = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
         return await service(session).update_primary_growth_goal(
+            context, workspace_id, changes=changes, actor_id=payload.actor_id
+        )
+
+    @router.post(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/autonomy-policy",
+        response_model=AutonomyPolicyResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_autonomy_policy(
+        workspace_id: UUID,
+        payload: AutonomyPolicyCreate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        values = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        return await service(session).create_autonomy_policy(
+            context, workspace_id, values=values, actor_id=payload.actor_id
+        )
+
+    @router.get(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/autonomy-policy",
+        response_model=AutonomyPolicyResponse,
+    )
+    async def get_autonomy_policy(workspace_id: UUID, context: Context, session: Session) -> object:
+        return await service(session).get_autonomy_policy(context, workspace_id)
+
+    @router.patch(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/autonomy-policy",
+        response_model=AutonomyPolicyResponse,
+    )
+    async def update_autonomy_policy(
+        workspace_id: UUID,
+        payload: AutonomyPolicyUpdate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        changes = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        return await service(session).update_autonomy_policy(
             context, workspace_id, changes=changes, actor_id=payload.actor_id
         )
 

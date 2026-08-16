@@ -2,10 +2,19 @@ from datetime import date, datetime
 from typing import Annotated, TypeVar
 from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    model_validator,
+)
 
 from growth_os.db.models import (
     ApprovalDecisionValue,
+    AutonomyLevel,
     ConnectorStatus,
     MembershipRole,
     ProposalStatus,
@@ -150,6 +159,34 @@ class PrimaryGrowthGoalResponse(AuditFields):
     objective: str
     success_definition: str | None
     target_date: date | None
+
+
+class AutonomyPolicyCreate(StrictInput):
+    level: AutonomyLevel
+    is_paused: StrictBool = True
+    actor_id: UUID | None = None
+
+
+class AutonomyPolicyUpdate(StrictInput):
+    level: AutonomyLevel | None = None
+    is_paused: StrictBool | None = None
+    actor_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def includes_policy_change(self) -> "AutonomyPolicyUpdate":
+        supplied = self.model_fields_set - {"actor_id"}
+        if not supplied:
+            raise ValueError("At least one autonomy policy field must be updated")
+        if any(getattr(self, field) is None for field in supplied):
+            raise ValueError("Autonomy policy fields cannot be cleared")
+        return self
+
+
+class AutonomyPolicyResponse(AuditFields):
+    tenant_id: UUID
+    workspace_id: UUID
+    level: AutonomyLevel
+    is_paused: bool
 
 
 class MembershipCreate(StrictInput):
