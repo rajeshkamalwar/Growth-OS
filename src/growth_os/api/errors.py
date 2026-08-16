@@ -23,6 +23,11 @@ class ConflictError(ApplicationError):
         super().__init__(409, "conflict", "Resource already exists")
 
 
+class InvalidStateTransitionError(ApplicationError):
+    def __init__(self, message: str = "Invalid state transition") -> None:
+        super().__init__(409, "invalid_state_transition", message)
+
+
 def error_body(code: str, message: str, details: Any | None = None) -> dict[str, Any]:
     error: dict[str, Any] = {"code": code, "message": message}
     if details is not None:

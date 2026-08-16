@@ -1,33 +1,31 @@
 # Current Task
 
 ## Task ID
-FOUNDATION-003 (GitHub issue #5)
+FOUNDATION-004 (GitHub issue #9)
 
 ## Authorization
-Build the tenant-safe CRUD and control-plane API foundation on FOUNDATION-002.
+Build the tenant-safe internal execution/control layer on FOUNDATION-003.
 
 ## Goal
-Add tenant-safe repository/service boundaries and minimal validated APIs for tenant,
-workspace, membership, site, and connector-status foundation resources.
+Add execution jobs/runs, inert action proposals, approval decisions, bounded retries,
+idempotency, and an audit trail without performing external actions.
 
 ## Required Outcome
-- Tenant-owned lookups and mutations require explicit tenant context.
-- Cross-tenant reads and writes fail safely and are covered by tests.
-- API input/output schemas, bounded pagination, structured errors, identifiers, and
-  audit timestamps form a stable first control-plane contract.
-- Health and readiness behavior from FOUNDATION-002 remains intact.
-- Connector status remains a placeholder only.
+- Execution and proposal state is explicit and terminal transitions are guarded.
+- Every execution request is idempotent within its tenant.
+- Approval decisions are append-only, tenant-safe, and final.
+- High-risk proposed actions cannot bypass explicit human approval.
+- Meaningful execution and decision changes create tenant-scoped audit events.
+- Control-plane list APIs preserve bounded pagination and structured errors.
 
 ## Constraints
-- Keep tenant context provider-neutral; do not invent or redesign authentication.
-- Do not change tenant-isolation architecture, billing, production infrastructure,
-  secrets, or destructive migrations.
-- Do not add external connectors, autonomous side effects, product agents, a frontend,
-  deployment workflows, OpenAI/LLM integrations, n8n, or Temporal.
+- Do not add an executor, scheduler, connector, agent, LLM, n8n, or Temporal integration.
+- Do not change tenant-context or authentication architecture.
+- Do not perform external actions or production side effects.
 - Follow `AGENTS.md` and the repository source-of-truth documents.
 
 ## Completion Gates
 - Ruff format/lint, strict mypy, pytest, pip-audit, migration validation, and
   `git diff --check` pass where available.
-- Database constraints from FOUNDATION-002 remain intact.
+- Existing health/readiness and FOUNDATION-003 APIs remain intact.
 - Work is delivered from a task branch through a draft pull request.

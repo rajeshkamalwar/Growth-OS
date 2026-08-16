@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from growth_os.api.errors import install_error_handlers
+from growth_os.api.execution import create_execution_router
 from growth_os.api.foundation import create_foundation_router
 from growth_os.api.health import ReadinessProbe, create_health_router
 from growth_os.core.config import Settings, get_settings
@@ -51,6 +52,7 @@ def create_app(
     install_error_handlers(app)
     app.include_router(create_health_router(app_readiness_probe))
     app.include_router(create_foundation_router(app_session_factory))
+    app.include_router(create_execution_router(app_session_factory))
     return app
 
 
