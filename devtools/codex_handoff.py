@@ -22,9 +22,9 @@ import re
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NotRequired, TextIO, TypedDict, cast
+from typing import Any, TextIO, TypedDict, cast
 
 REPO = os.environ.get("GROWTH_OS_REPO", "rajeshkamalwar/Growth-OS")
 OWNER = os.environ.get("GROWTH_OS_OWNER", "rajeshkamalwar")
@@ -45,12 +45,15 @@ class IssueAuthor(TypedDict):
     login: str
 
 
-class Issue(TypedDict):
+class RequiredIssue(TypedDict):
     number: int
     title: str
-    body: NotRequired[str | None]
-    author: NotRequired[IssueAuthor | None]
-    url: NotRequired[str]
+
+
+class Issue(RequiredIssue, total=False):
+    body: str | None
+    author: IssueAuthor | None
+    url: str
 
 
 class StatusContext(TypedDict):
@@ -61,7 +64,8 @@ class StatusContext(TypedDict):
 
 
 def now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    # timezone.utc keeps this standalone controller compatible with the documented Python 3.9.
+    return datetime.now(timezone.utc).isoformat()  # noqa: UP017
 
 
 def run(
