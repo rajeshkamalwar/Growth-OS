@@ -3,13 +3,15 @@
 ## Status: Proposed — approval required; not authorized for implementation
 
 This plan preserves the complete proposed contract from
-[GitHub issue #80](https://github.com/rajeshkamalwar/Growth-OS/issues/80). This is a proposed
-outbound-network security contract. Do not apply `codex-ready` or implement it until the user
-explicitly approves the robots.txt acquisition boundary after this planning proposal is merged.
+[GitHub issue #80](https://github.com/rajeshkamalwar/Growth-OS/issues/80).
 
 Neither planning issue #81 nor its merge authorizes `codex-ready` on issue #80, implementation,
 implementation merge, live retrieval, permission evaluation, crawling, caching, scheduling,
 integration, deployment, or any external activity.
+
+## Status: explicit security approval required
+
+This issue is a proposed outbound-network security contract. Do not apply `codex-ready` or implement it until the user explicitly approves the robots.txt acquisition boundary after its planning proposal is merged.
 
 ## Objective
 
