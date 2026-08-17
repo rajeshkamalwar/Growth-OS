@@ -1,22 +1,29 @@
 # PRODUCT-012: Offline Robots Acquisition Outcome Gate
 
-## Status: Proposed — approval required; not authorized for implementation
+## Status and Authority
 
-This plan preserves the complete proposed contract from
-[GitHub issue #86](https://github.com/rajeshkamalwar/Growth-OS/issues/86).
+**Implementation explicitly approved 2026-08-17 — executable after this planning PR merges and
+the orchestrator re-inspects `main`; separate human implementation-merge approval required.**
 
-Do not apply `codex-ready` to issue #86 or implement this proposal until the user explicitly
-approves this exact offline gate after this planning proposal is merged.
+This plan preserves the exact contract from
+[GitHub issue #86](https://github.com/rajeshkamalwar/Growth-OS/issues/86). The user explicitly
+approved implementation under that contract on 2026-08-17. The approval becomes executable only
+after planning issue #89's PR merges and the orchestrator re-inspects `main`.
 
-Neither planning issue #87 nor its merge authorizes `codex-ready` on issue #86, implementation,
-implementation merge, live retrieval, crawling, caching, scheduling, persistence, integration,
-deployment, or any external activity.
+Planning issue #89 does not itself queue implementation. Only after the merge and reinspection may
+the orchestrator apply `codex-ready` to issue #86. Approval authorizes only the deterministic,
+synchronous, offline gate, its values/fakes-only tests and verification, and a reviewed draft
+implementation PR under issue #86's exact contract. It does not authorize implementation merge,
+live retrieval, target-page fetching, crawling, caching, scheduling, persistence, tenant/site
+binding, audit integration, runtime integration, deployment, production traffic,
+external/customer-facing activity, or weakening or broadening issue #86.
 
-## Security status: explicit security approval required
+## Security status: implementation approved; human merge approval required
 
-This issue is a proposed material security-policy contract. Do not apply `codex-ready` or
-implement it until the user explicitly approves this exact offline gate after its planning
-proposal is merged.
+This is an approved material security-policy contract. After this planning PR merges and the
+orchestrator re-inspects `main`, the orchestrator may queue implementation under issue #86. The
+implementation PR must remain open after all gates and a fresh independent
+protocol/security-focused read-only review for a separate explicit human merge decision.
 
 ## Objective
 
@@ -26,7 +33,15 @@ This milestone performs no HTTP, DNS, file access, URL construction, redirects, 
 
 ## Risk and approval boundary
 
-Risk is **high** because the mapping determines whether a future crawler could proceed after a robots acquisition outcome or failure. Approval would authorize implementation, tests, verification, and a reviewed draft PR only. It would not authorize implementation merge, live retrieval, target-page fetching, crawling, caching, scheduling, persistence, tenant/site binding, audit, deployment, production traffic, or any external/customer-facing effect.
+Risk is **high** because the mapping determines whether a future crawler could proceed after a
+robots acquisition outcome or failure. Approval authorizes implementation, values/fakes-only
+tests, verification, and a reviewed draft PR only. After all gates pass, including a fresh
+independent protocol/security-focused read-only review with zero blocking findings, the
+implementation PR must not be auto-merged and must remain open for a separate explicit human merge
+decision. Approval does not authorize implementation merge, live retrieval, target-page fetching,
+crawling, caching, scheduling, persistence, tenant/site binding, audit integration, runtime
+integration, deployment, production traffic, external/customer-facing activity, or weakening or
+broadening issue #86.
 
 ## Public contract
 
@@ -127,7 +142,10 @@ Run all robots and acquisition tests, evidence regressions, full pytest, Ruff li
 
 ## Delivery and rollback
 
-After explicit approval, deliver implementation on a dedicated branch through a reviewed draft PR and stop for a separate explicit human merge decision because this defines material crawler-permission semantics. Do not deploy or perform any live request.
+After this planning PR merges and the orchestrator re-inspects `main`, deliver implementation on a
+dedicated branch through a reviewed draft PR and stop for a separate explicit human merge decision
+because this defines material crawler-permission semantics. Do not deploy or perform any live
+request.
 
 Rollback is reverting the implementation commit and removing the gate API/tests. No dependency, schema, durable data, production resource, credential, or external state requires recovery.
 
@@ -146,19 +164,23 @@ Rollback is reverting the implementation commit and removing the gate API/tests.
 
 ## Planning delivery and rollback
 
-Planning issue #87 changes exactly `docs/CURRENT-TASK.md` and this plan. It records PRODUCT-011 as
-merged and PRODUCT-012 as proposed, but it does not itself queue or implement PRODUCT-012 and does
-not authorize `codex-ready` on issue #86, implementation merge, or any external activity.
+Planning issue #89 changes exactly `docs/CURRENT-TASK.md` and this plan. It records the user's
+explicit implementation approval but does not itself queue or implement PRODUCT-012. Only after
+this planning PR merges and the orchestrator re-inspects `main` may the orchestrator apply
+`codex-ready` to issue #86. Neither planning issue #89 nor its merge authorizes implementation
+merge, live retrieval, target-page fetching, crawling, caching, scheduling, persistence,
+tenant/site binding, audit integration, runtime integration, deployment, production traffic,
+external/customer-facing activity, or weakening or broadening issue #86.
 
 Validate documentation/link/command/path hygiene, all repository local gates, offline migration
 rendering, `git diff --check`, and exact two-file scope. Obtain a fresh separate read-only
 protocol/security review with zero blocking findings, then deliver the planning change on a
 dedicated branch through a draft PR.
 
-Planning rollback restores PRODUCT-011 as current and removes this PRODUCT-012 proposal. No
-runtime, dependency, schema, data, production, or external recovery is needed.
+Planning rollback restores the proposal-only approval gate for PRODUCT-012. No runtime,
+dependency, schema, data, production, or external recovery is needed.
 
-The planning issue #87 assessment is:
+The planning issue #89 assessment is:
 
 ```json
 {
@@ -170,3 +192,8 @@ The planning issue #87 assessment is:
   "stop_categories": []
 }
 ```
+
+The planning assessment authorizes only the reversible documentation change. The user's recorded
+approval separately authorizes PRODUCT-012 implementation only after this planning PR merges and
+the orchestrator re-inspects `main`; neither authorization permits implementation merge, live
+network activity, runtime integration, deployment, or any external/customer-facing action.
