@@ -24,10 +24,15 @@ def test_public_contract_is_exported_value_backed_and_immutable() -> None:
         "RobotsAccessReason",
         "RobotsDecision",
         "RobotsDecisionReason",
+        "RobotsGateDecision",
+        "RobotsGateError",
+        "RobotsGateErrorCode",
+        "RobotsGateReason",
         "RobotsPolicyError",
         "RobotsPolicyErrorCode",
         "evaluate_robots",
         "evaluate_robots_access",
+        "evaluate_robots_gate",
     ]
     assert issubclass(RobotsAccessReason, StrEnum)
     assert list(RobotsAccessReason) == [
