@@ -2,17 +2,19 @@
 
 ## Status and Authority
 
-**Proposed — approval required; not authorized for implementation.**
+**Implementation explicitly approved 2026-08-17 — executable after this planning PR merges and
+the orchestrator re-inspects `main`; separate human implementation-merge approval required.**
 
-This plan records the proposed runtime contract from
-[GitHub issue #68](https://github.com/rajeshkamalwar/Growth-OS/issues/68) exactly, without
-authorizing it. PRODUCT-008 is merged, and PRODUCT-009 is the next dependency awaiting explicit
-security approval.
+This plan preserves the exact runtime contract from
+[GitHub issue #68](https://github.com/rajeshkamalwar/Growth-OS/issues/68). The user explicitly
+approved implementation under that contract on 2026-08-17. The approval becomes executable only
+after this planning PR merges and the orchestrator re-inspects `main`.
 
-Do not apply `codex-ready` or implement issue #68 until the user explicitly approves the robots
-permission policy after this planning proposal is merged. Neither planning issue #69 nor its merge
-authorizes applying `codex-ready` to issue #68, runtime implementation, implementation merge,
-deployment, retrieval, or crawling.
+This planning task does not itself queue implementation. Only after the merge and re-inspection
+may the orchestrator apply `codex-ready` to issue #68. The approval authorizes only the
+deterministic offline evaluator, its tests and verification, and a reviewed draft implementation
+PR. It does not authorize merging that PR, deployment, retrieval, crawling, scheduling, runtime
+integration, or any external/customer-facing effect.
 
 ## Objective
 
@@ -28,9 +30,13 @@ runtime path.
 ## Risk and Approval Boundary
 
 Risk is **high** because these semantics will eventually determine whether autonomous network
-access is permitted. Approval authorizes implementation and a reviewed draft PR only. It does not
-authorize merging the implementation, fetching robots.txt, integrating with PRODUCT-008,
-crawling, deployment, production traffic, or treating robots.txt as an access-control mechanism.
+access is permitted. Approval authorizes implementation and a reviewed draft PR only. After all
+gates pass, including a fresh independent protocol/security-focused read-only review with zero
+blocking findings, the implementation PR must not be auto-merged and must remain open for a
+separate explicit human merge decision. Approval does not authorize merging the implementation,
+fetching robots.txt or any other network resource, integrating with PRODUCT-008, crawling or
+scheduling, deployment or production traffic, any external/customer-facing effect, treating
+robots.txt as an access-control mechanism, or weakening or broadening issue #68's contract.
 
 ## Public Contract
 
@@ -172,21 +178,22 @@ findings.
 
 ## Delivery and Rollback
 
-After explicit approval, deliver implementation on a dedicated branch through a draft PR and stop
-for a separate human merge decision because this is a material security policy. Do not deploy.
+After this planning PR merges and the orchestrator re-inspects `main`, implementation may be
+delivered on a dedicated branch through a reviewed draft PR. Stop for a separate explicit human
+merge decision because this is a material security policy; do not auto-merge or deploy.
 Rollback is reverting the implementation commit; no dependency, schema, durable data, production
 resource, or external state requires recovery.
 
-Planning issue #69 changes exactly `docs/CURRENT-TASK.md` and this new plan. Validate documentation
+Planning issue #71 changes exactly `docs/CURRENT-TASK.md` and this plan. Validate documentation
 format, links, commands, paths, final changed-file scope, and `git diff --check`; obtain a fresh
-separate protocol/security-focused read-only review with zero blocking findings; then deliver the
-planning change on a dedicated branch through a draft PR. Planning rollback restores PRODUCT-008
-as the recorded current task and removes this proposal; no runtime, dependency, schema, data,
-production, or external recovery is needed.
+separate read-only review with zero blocking findings; then deliver the planning change on a
+dedicated branch through a draft PR. This planning task does not queue implementation. Planning
+rollback restores the proposal-only approval gate for PRODUCT-009; no runtime, dependency, schema,
+data, production, or external recovery is needed.
 
 ## Auto-Merge Assessment
 
-The authoritative proposed implementation assessment is:
+The authoritative approved implementation assessment is:
 
 ```json
 {
@@ -199,7 +206,7 @@ The authoritative proposed implementation assessment is:
 }
 ```
 
-The planning issue #69 assessment is:
+The planning issue #71 assessment is:
 
 ```json
 {
@@ -212,5 +219,7 @@ The planning issue #69 assessment is:
 }
 ```
 
-The planning assessment authorizes only the reversible documentation change. It does not
-authorize any PRODUCT-009 runtime or external action.
+The planning assessment authorizes only the reversible documentation change. The user's recorded
+approval separately authorizes PRODUCT-009 implementation only after this planning PR merges and
+the orchestrator re-inspects `main`; neither authorization permits any external action or merging
+the implementation PR.
