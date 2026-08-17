@@ -81,6 +81,16 @@ Run the complete local verification suite with:
 make check
 ```
 
+## Offline on-page evidence extraction
+
+`growth_os.evidence.extract_on_page_evidence` deterministically extracts a bounded internal
+`OnPageEvidence` value from caller-supplied HTML and its HTTP(S) source URL. It reports only the
+observed title, meta description, canonical URL, robots content, HTML language, and H1 text using
+Python standard-library parsing.
+
+This component is offline parsing substrate only. It does not fetch URLs, resolve DNS, read files,
+persist or audit content, score pages, infer missing values, recommend changes, or execute actions.
+
 Stop PostgreSQL with `docker compose down`. The named database volume is retained; use
 `docker compose down --volumes` only when intentionally discarding local development data.
 
