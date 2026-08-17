@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -167,6 +168,47 @@ class WorkspaceAutonomyPolicy(UUIDTimestampMixin, Base):
     def __init__(self, **kwargs: object) -> None:
         kwargs.setdefault("is_paused", True)
         super().__init__(**kwargs)
+
+
+class WorkspaceCompetitor(UUIDTimestampMixin, Base):
+    __tablename__ = "workspace_competitors"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "tenant_id"],
+            ["workspaces.id", "workspaces.tenant_id"],
+            ondelete="RESTRICT",
+            name="fk_workspace_competitors_workspace_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "workspace_id",
+            "name",
+            name="uq_workspace_competitors_tenant_workspace_name",
+        ),
+        CheckConstraint(
+            "length(name) BETWEEN 1 AND 200",
+            name="workspace_competitor_name_length",
+        ),
+        CheckConstraint("name = trim(name)", name="workspace_competitor_name_trimmed"),
+        CheckConstraint(
+            "website_url IS NULL OR length(website_url) <= 2048",
+            name="workspace_competitor_website_url_length",
+        ),
+        CheckConstraint(
+            "notes IS NULL OR length(notes) BETWEEN 1 AND 4000",
+            name="workspace_competitor_notes_length",
+        ),
+        CheckConstraint(
+            "notes IS NULL OR notes = trim(notes)",
+            name="workspace_competitor_notes_trimmed",
+        ),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(nullable=False)
+    workspace_id: Mapped[UUID] = mapped_column(nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    website_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Membership(UUIDTimestampMixin, Base):

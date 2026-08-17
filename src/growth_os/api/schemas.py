@@ -208,6 +208,37 @@ class AutonomyPolicyResponse(AuditFields):
     is_paused: bool
 
 
+class WorkspaceCompetitorCreate(StrictInput):
+    name: str = Field(min_length=1, max_length=200)
+    website_url: AnyHttpUrl | None = Field(default=None, max_length=2048)
+    notes: str | None = Field(default=None, min_length=1, max_length=4000)
+    actor_id: UUID | None = None
+
+
+class WorkspaceCompetitorUpdate(StrictInput):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    website_url: AnyHttpUrl | None = Field(default=None, max_length=2048)
+    notes: str | None = Field(default=None, min_length=1, max_length=4000)
+    actor_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def includes_competitor_change(self) -> "WorkspaceCompetitorUpdate":
+        supplied = self.model_fields_set - {"actor_id"}
+        if not supplied:
+            raise ValueError("At least one competitor field must be updated")
+        if "name" in supplied and self.name is None:
+            raise ValueError("Competitor name cannot be cleared")
+        return self
+
+
+class WorkspaceCompetitorResponse(AuditFields):
+    tenant_id: UUID
+    workspace_id: UUID
+    name: str
+    website_url: str | None
+    notes: str | None
+
+
 class MembershipCreate(StrictInput):
     workspace_id: UUID
     user_id: UUID

@@ -31,6 +31,9 @@ from growth_os.api.schemas import (
     TenantCreate,
     TenantResponse,
     TenantUpdate,
+    WorkspaceCompetitorCreate,
+    WorkspaceCompetitorResponse,
+    WorkspaceCompetitorUpdate,
     WorkspaceCreate,
     WorkspaceResponse,
     WorkspaceUpdate,
@@ -247,6 +250,76 @@ def create_foundation_router(
         changes = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
         return await service(session).update_autonomy_policy(
             context, workspace_id, changes=changes, actor_id=payload.actor_id
+        )
+
+    @router.post(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/competitors",
+        response_model=WorkspaceCompetitorResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_competitor(
+        workspace_id: UUID,
+        payload: WorkspaceCompetitorCreate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        values = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        if values.get("website_url") is not None:
+            values["website_url"] = str(values["website_url"])
+        return await service(session).create_competitor(
+            context, workspace_id, values=values, actor_id=payload.actor_id
+        )
+
+    @router.get(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/competitors",
+        response_model=Page[WorkspaceCompetitorResponse],
+    )
+    async def list_competitors(
+        workspace_id: UUID,
+        context: Context,
+        session: Session,
+        limit: Limit = 50,
+        offset: Offset = 0,
+    ) -> Page[WorkspaceCompetitorResponse]:
+        items, total = await service(session).list_competitors(
+            context, workspace_id, limit=limit, offset=offset
+        )
+        return page(
+            [WorkspaceCompetitorResponse.model_validate(item) for item in items],
+            total,
+            limit,
+            offset,
+        )
+
+    @router.get(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/competitors/{competitor_id}",
+        response_model=WorkspaceCompetitorResponse,
+    )
+    async def get_competitor(
+        workspace_id: UUID, competitor_id: UUID, context: Context, session: Session
+    ) -> object:
+        return await service(session).get_competitor(context, workspace_id, competitor_id)
+
+    @router.patch(
+        "/tenants/{tenant_id}/workspaces/{workspace_id}/competitors/{competitor_id}",
+        response_model=WorkspaceCompetitorResponse,
+    )
+    async def update_competitor(
+        workspace_id: UUID,
+        competitor_id: UUID,
+        payload: WorkspaceCompetitorUpdate,
+        context: Context,
+        session: Session,
+    ) -> object:
+        changes = payload.model_dump(exclude={"actor_id"}, exclude_unset=True)
+        if changes.get("website_url") is not None:
+            changes["website_url"] = str(changes["website_url"])
+        return await service(session).update_competitor(
+            context,
+            workspace_id,
+            competitor_id,
+            changes=changes,
+            actor_id=payload.actor_id,
         )
 
     @router.post(

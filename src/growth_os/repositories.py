@@ -14,6 +14,7 @@ from growth_os.db.models import (
     Workspace,
     WorkspaceAutonomyPolicy,
     WorkspaceBusinessProfile,
+    WorkspaceCompetitor,
     WorkspacePrimaryGrowthGoal,
 )
 
@@ -117,6 +118,48 @@ class FoundationRepository:
                 )
             ),
         )
+
+    async def get_competitor(
+        self, context: TenantContext, workspace_id: UUID, competitor_id: UUID
+    ) -> WorkspaceCompetitor | None:
+        return cast(
+            WorkspaceCompetitor | None,
+            await self.session.scalar(
+                select(WorkspaceCompetitor).where(
+                    WorkspaceCompetitor.tenant_id == context.tenant_id,
+                    WorkspaceCompetitor.workspace_id == workspace_id,
+                    WorkspaceCompetitor.id == competitor_id,
+                )
+            ),
+        )
+
+    async def list_competitors(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[WorkspaceCompetitor], int]:
+        predicate = (
+            WorkspaceCompetitor.tenant_id == context.tenant_id,
+            WorkspaceCompetitor.workspace_id == workspace_id,
+        )
+        items = list(
+            (
+                await self.session.scalars(
+                    select(WorkspaceCompetitor)
+                    .where(*predicate)
+                    .order_by(WorkspaceCompetitor.created_at, WorkspaceCompetitor.id)
+                    .limit(limit)
+                    .offset(offset)
+                )
+            ).all()
+        )
+        total = await self.session.scalar(
+            select(func.count()).select_from(WorkspaceCompetitor).where(*predicate)
+        )
+        return items, total or 0
 
     async def get_onboarding_record_status(
         self, context: TenantContext, workspace_id: UUID

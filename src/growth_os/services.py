@@ -15,6 +15,7 @@ from growth_os.db.models import (
     Workspace,
     WorkspaceAutonomyPolicy,
     WorkspaceBusinessProfile,
+    WorkspaceCompetitor,
     WorkspacePrimaryGrowthGoal,
 )
 from growth_os.repositories import FoundationRepository, TenantContext
@@ -290,6 +291,104 @@ class FoundationService:
             )
         )
         return await self._persist_autonomy_policy(policy)
+
+    async def create_competitor(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        *,
+        values: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspaceCompetitor:
+        await self.get_owned(Workspace, context, workspace_id)
+        competitor = WorkspaceCompetitor(
+            tenant_id=context.tenant_id, workspace_id=workspace_id, **values
+        )
+        try:
+            self.repository.add(competitor)
+            await self.repository.flush()
+            self.repository.add(
+                self._competitor_audit(
+                    competitor, "workspace_competitor.created", sorted(values), actor_id
+                )
+            )
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            raise ConflictError from error
+        except Exception:
+            await self.repository.rollback()
+            raise
+        await self.repository.refresh(competitor)
+        return competitor
+
+    async def list_competitors(
+        self, context: TenantContext, workspace_id: UUID, *, limit: int, offset: int
+    ) -> tuple[list[WorkspaceCompetitor], int]:
+        await self.get_owned(Workspace, context, workspace_id)
+        return await self.repository.list_competitors(
+            context, workspace_id, limit=limit, offset=offset
+        )
+
+    async def get_competitor(
+        self, context: TenantContext, workspace_id: UUID, competitor_id: UUID
+    ) -> WorkspaceCompetitor:
+        await self.get_owned(Workspace, context, workspace_id)
+        competitor = await self.repository.get_competitor(context, workspace_id, competitor_id)
+        if competitor is None:
+            raise NotFoundError
+        return competitor
+
+    async def update_competitor(
+        self,
+        context: TenantContext,
+        workspace_id: UUID,
+        competitor_id: UUID,
+        *,
+        changes: Mapping[str, Any],
+        actor_id: UUID | None,
+    ) -> WorkspaceCompetitor:
+        competitor = await self.get_competitor(context, workspace_id, competitor_id)
+        for field, value in changes.items():
+            setattr(competitor, field, value)
+        self.repository.add(
+            self._competitor_audit(
+                competitor, "workspace_competitor.updated", sorted(changes), actor_id
+            )
+        )
+        return await self._persist_competitor(competitor)
+
+    @staticmethod
+    def _competitor_audit(
+        competitor: WorkspaceCompetitor,
+        event_type: str,
+        changed_fields: list[str],
+        actor_id: UUID | None,
+    ) -> AuditEvent:
+        return AuditEvent(
+            tenant_id=competitor.tenant_id,
+            event_type=event_type,
+            resource_type="workspace_competitor",
+            resource_id=competitor.id,
+            actor_id=actor_id,
+            details={
+                "workspace_id": str(competitor.workspace_id),
+                "changed_fields": changed_fields,
+            },
+        )
+
+    async def _persist_competitor(self, competitor: WorkspaceCompetitor) -> WorkspaceCompetitor:
+        try:
+            await self.repository.flush()
+            await self.repository.commit()
+        except IntegrityError as error:
+            await self.repository.rollback()
+            raise ConflictError from error
+        except Exception:
+            await self.repository.rollback()
+            raise
+        await self.repository.refresh(competitor)
+        return competitor
 
     @staticmethod
     def _autonomy_policy_audit(

@@ -56,6 +56,14 @@ grant permission, change approval requirements, start work, or enforce a runtime
 Successful mutations add one redacted audit event containing only the workspace ID and
 alphabetically sorted explicitly supplied policy field names.
 
+Each workspace may store a bounded catalog of customer-supplied competitors at
+`/api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/competitors`. Use `POST` on the collection,
+`GET` on the collection or a nested `/{competitor_id}`, and `PATCH` on a nested competitor.
+Names are required; normalized HTTP(S) website URLs and notes are optional and may be cleared.
+The catalog is inert stored context only: it performs no crawling, discovery, monitoring,
+inference, outreach, backlink activity, connector call, or external action. Successful mutations
+add one value-redacted audit containing only the workspace ID and sorted supplied field names.
+
 Read foundational onboarding completeness with
 `GET /api/v1/tenants/{tenant_id}/workspaces/{workspace_id}/onboarding-status`. The response reports
 only whether the workspace has at least one site and stored business-profile, primary-growth-goal,
@@ -99,3 +107,11 @@ Retaining the table cannot trigger actions because this milestone adds no enforc
 The PRODUCT-003 downgrade drops only that table and permanently deletes its policy rows, so use it
 only in a disposable development database. Downgrading meaningful shared or production data
 requires explicit approval, a verified backup, and a documented, tested recovery plan.
+
+For PRODUCT-005, revert the application code while retaining the additive
+`workspace_competitors` table to stop catalog operations without deleting customer context. The
+PRODUCT-005 downgrade drops only that table and permanently deletes every competitor row, so use
+it only in a disposable development database. Before any downgrade involving meaningful data,
+stop writes, obtain explicit approval, take and verify a backup, and test recovery. Reapply the
+migration before restoring rows, then validate tenant/workspace ownership and exact-name
+uniqueness.
