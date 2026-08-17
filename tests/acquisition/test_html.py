@@ -100,6 +100,10 @@ def test_public_contract_is_exact_and_immutable() -> None:
         "HtmlFetchError",
         "FetchedHtml",
         "fetch_html",
+        "RobotsFetchErrorCode",
+        "RobotsFetchError",
+        "FetchedRobots",
+        "fetch_robots",
     ]
     assert list(acquisition.HtmlFetchErrorCode) == [
         acquisition.HtmlFetchErrorCode.INVALID_URL,
