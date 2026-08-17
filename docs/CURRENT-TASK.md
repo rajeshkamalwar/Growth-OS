@@ -2,49 +2,44 @@
 
 ## Task ID
 
-PRODUCT-010 ([GitHub issue #74](https://github.com/rajeshkamalwar/Growth-OS/issues/74))
+PRODUCT-011 ([GitHub issue #80](https://github.com/rajeshkamalwar/Growth-OS/issues/80))
 
-## Status: Implementation Approved — Executable After Planning Merge and Reinspection
+## Status: Proposed — Approval Required; Not Authorized for Implementation
 
-PRODUCT-009 is merged. The next dependency is the approved offline robots access-outcome policy
-recorded in [`plans/PRODUCT-010.md`](../plans/PRODUCT-010.md).
+PRODUCT-010 is merged. The next proposed dependency is the fail-closed robots.txt acquisition
+boundary recorded in [`plans/PRODUCT-011.md`](../plans/PRODUCT-011.md).
 
-The user explicitly approved PRODUCT-010 implementation on 2026-08-17 under issue #74's exact
-contract. That approval becomes executable only after planning issue #77's PR merges and the
-orchestrator re-inspects `main`. This planning issue does not itself queue implementation; only
-after that merge and reinspection may the orchestrator apply `codex-ready` to issue #74.
+PRODUCT-011 remains an approval gate, not an executable task. It is **high risk** because it adds
+outbound network behavior and may refactor the shared SSRF/TLS transport boundary. Do not apply
+`codex-ready` to issue #80 or implement it until the user explicitly approves the complete
+proposal after this planning PR merges.
 
-Approval authorizes only the deterministic offline access-outcome interpreter, its tests,
-verification, and a reviewed draft implementation PR under issue #74's exact contract.
-PRODUCT-010 remains **high risk** because it defines material security semantics for future
-network permission. After all gates and a fresh independent protocol/security-focused read-only
-review have zero blocking findings, the implementation PR must not be auto-merged and must remain
-open for a separate explicit human merge decision.
+Neither planning issue #81 nor its merge authorizes `codex-ready` on issue #80, implementation,
+implementation merge, live retrieval, permission evaluation, crawling, caching, scheduling,
+integration, deployment, or any external activity.
 
-Approval does not authorize implementation merge, robots.txt retrieval, HTTP/DNS, caching,
-redirects, integration with PRODUCT-008, crawling, scheduling, deployment, production traffic,
-external/customer-facing activity, or weakening or broadening issue #74.
+## Proposed Runtime Boundary
 
-## Authorized Runtime Boundary
+The proposal adds an explicitly invoked, asynchronous, fail-closed robots.txt acquisition
+primitive for a caller-supplied public HTTP(S) site URL. It derives the initial authority's root
+`/robots.txt` URL, fetches through the same SSRF-resistant per-hop transport guarantees as
+PRODUCT-008, and returns a bounded terminal status/body value that may later be supplied to
+PRODUCT-010 only through a separately approved integration.
 
-The approved contract adds a deterministic offline interpreter over a caller-supplied retrieval
-outcome, caller-supplied robots bytes where applicable, and caller-supplied target path. It
-composes the merged PRODUCT-009 evaluator and returns a value-backed access decision with exact
-status, nested-policy, or policy-error provenance.
+The complete proposed contract, including its public types, URL derivation, shared transport
+constraints, SSRF/DNS/rebinding/TLS guarantees, request protocol, terminal-response handling,
+bounded body rules, cleanup, isolation tests, risk gates, future integration requirements, and
+rollback, is preserved in [`plans/PRODUCT-011.md`](../plans/PRODUCT-011.md) from issue #80.
 
-The complete approved contract, strict input invariants, RFC 9309 outcome semantics, fail-closed
-behavior, tests, future integration gates, risk, and rollback are preserved in
-[`plans/PRODUCT-010.md`](../plans/PRODUCT-010.md) from issue #74.
-
-The implementation performs no HTTP, DNS, file access, URL construction, redirects, caching,
-scheduling, persistence, logging, audit, active enforcement, or runtime integration. Any future
-acquisition or crawler integration requires a separately reviewed and approved contract.
+The proposal remains unintegrated. It does not evaluate permission, fetch a target page, crawl,
+cache, schedule, persist, audit, expose an API/CLI, or run from an active application path. Tests
+must use controlled fakes only and must never contact a real website.
 
 ## Planning Delivery and Rollback
 
-Planning issue #77 is documentation only. It changes exactly this file and
-`plans/PRODUCT-010.md`; it does not modify runtime code, tests, README, dependencies, migrations,
+Planning issue #81 is documentation only. It changes exactly this file and
+`plans/PRODUCT-011.md`; it does not modify runtime code, tests, README, dependencies, migrations,
 protected product/architecture/goal/decision documents, infrastructure, or deployment.
 
-Planning rollback restores the proposal-only approval gate for PRODUCT-010. No runtime,
-dependency, schema, data, production, or external recovery is needed.
+Planning rollback restores PRODUCT-010 as current and removes the PRODUCT-011 proposal. No
+runtime, dependency, schema, data, production, or external recovery is needed.
