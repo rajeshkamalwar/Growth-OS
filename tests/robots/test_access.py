@@ -20,8 +20,11 @@ from growth_os.robots import access as access_module
 
 def test_public_contract_is_exported_value_backed_and_immutable() -> None:
     assert robots_package.__all__ == [
+        "BoundRobotsDecision",
         "RobotsAccessDecision",
         "RobotsAccessReason",
+        "RobotsBindingError",
+        "RobotsBindingErrorCode",
         "RobotsDecision",
         "RobotsDecisionReason",
         "RobotsGateDecision",
@@ -30,6 +33,7 @@ def test_public_contract_is_exported_value_backed_and_immutable() -> None:
         "RobotsGateReason",
         "RobotsPolicyError",
         "RobotsPolicyErrorCode",
+        "evaluate_bound_robots",
         "evaluate_robots",
         "evaluate_robots_access",
         "evaluate_robots_gate",
