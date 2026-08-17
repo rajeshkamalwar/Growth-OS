@@ -3,6 +3,13 @@ from growth_os.robots.access import (
     RobotsAccessReason,
     evaluate_robots_access,
 )
+from growth_os.robots.gate import (
+    RobotsGateDecision,
+    RobotsGateError,
+    RobotsGateErrorCode,
+    RobotsGateReason,
+    evaluate_robots_gate,
+)
 from growth_os.robots.policy import (
     RobotsDecision,
     RobotsDecisionReason,
@@ -16,8 +23,13 @@ __all__ = [
     "RobotsAccessReason",
     "RobotsDecision",
     "RobotsDecisionReason",
+    "RobotsGateDecision",
+    "RobotsGateError",
+    "RobotsGateErrorCode",
+    "RobotsGateReason",
     "RobotsPolicyError",
     "RobotsPolicyErrorCode",
     "evaluate_robots",
     "evaluate_robots_access",
+    "evaluate_robots_gate",
 ]
