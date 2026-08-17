@@ -1,8 +1,8 @@
 # PRODUCT-014: Offline Robots Cache Freshness Policy
 
-## Status: explicit security approval required
+## Status: implementation approved after planning merge and reinspection
 
-This issue proposes a material security-policy contract. Do not apply `codex-ready` or implement it until its planning proposal is merged and the user explicitly approves this exact offline freshness policy.
+On 2026-08-17, the user explicitly approved this exact material security-policy contract for implementation under issue #98. The authorization becomes executable only after the planning PR for issue #101 merges and the orchestrator re-inspects `main`. Planning issue #101 does not itself queue implementation; only after that merge and reinspection may the orchestrator apply `codex-ready` to issue #98.
 
 ## Objective
 
@@ -12,7 +12,9 @@ This milestone does not contain or return cached robots content, perform HTTP/DN
 
 ## Risk and approval boundary
 
-Risk is **high** because cache freshness determines whether a future crawler may reuse a prior robots acquisition outcome. Approval would authorize implementation, values-only tests, verification, and a reviewed draft PR only. It would not authorize implementation merge, stale-on-error reuse, storage, live retrieval, target fetching, crawling, scheduling, persistence, tenant/site database integration, audit, deployment, production traffic, or any external/customer-facing effect.
+Risk is **high** because cache freshness determines whether a future crawler may reuse a prior robots acquisition outcome. After the planning PR merges and `main` is re-inspected, approval authorizes only the deterministic, synchronous, offline fixed-24-hour policy, values-only tests, verification, and a reviewed draft implementation PR under issue #98's exact contract. It does not authorize implementation merge, stale-on-error reuse, cache storage or reuse, system-clock reads, live retrieval, target fetching, crawling, scheduling, persistence, tenant/site database integration, audit or runtime integration, deployment, production traffic, or any external/customer-facing effect. It does not weaken or broaden issue #98.
+
+The implementation PR must not be auto-merged and must remain open after all gates and a fresh independent time/cache/protocol/security-focused read-only review with zero blocking findings for a separate explicit human merge decision.
 
 ## Public contract
 
@@ -92,7 +94,7 @@ Run focused cache/robots/acquisition/evidence tests, full pytest, Ruff lint/form
 
 ## Delivery and rollback
 
-After explicit approval, deliver on a dedicated branch through a reviewed draft PR and stop for a separate explicit human merge decision. Do not deploy or perform any live request.
+After the planning PR merges and the orchestrator re-inspects `main`, deliver implementation on a dedicated branch through a reviewed draft PR and stop for a separate explicit human merge decision. Do not auto-merge, deploy, or perform any live request.
 
 Rollback removes the cache policy API/tests. No dependency, schema, durable data, production resource, credential, or external state requires recovery.
 
@@ -111,7 +113,7 @@ Rollback removes the cache policy API/tests. No dependency, schema, durable data
 
 ## Planning authorization boundary
 
-This planning issue is documentation only. It does not authorize `codex-ready` on #98, implementation, implementation merge, cache storage or reuse, live retrieval, target-page fetching, crawling, scheduling, persistence, tenant/site database integration, audit, runtime integration, deployment, production traffic, or external/customer-facing activity.
+Planning issue #101 is documentation only and does not itself queue implementation. It records the user's 2026-08-17 approval, which becomes executable only after this planning PR merges and the orchestrator re-inspects `main`; only then may the orchestrator apply `codex-ready` to #98. It does not authorize implementation merge, stale-on-error reuse, cache storage or reuse, system-clock reads, live retrieval, target-page fetching, crawling, scheduling, persistence, tenant/site database integration, audit or runtime integration, deployment, production traffic, or external/customer-facing activity. The values-only, offline, no-clock, no-storage, no-live-network boundary and every future-integration gate remain mandatory.
 
 Validate documentation format, links, commands, paths, exact two-file scope, full repository gates, offline Alembic upgrade/downgrade rendering, and `git diff --check`. Obtain a fresh separate read-only time/cache/protocol/security review with zero blocking findings. Deliver through a dedicated branch and draft PR.
 
