@@ -38,6 +38,20 @@ class FakeContent:
             yield chunk
 
 
+class BlockingContent:
+    def __init__(self, started: asyncio.Event, *, timeout: bool = False) -> None:
+        self.started = started
+        self.timeout = timeout
+
+    async def iter_chunked(self, size: int) -> Any:
+        assert size == 64 * 1024
+        self.started.set()
+        if self.timeout:
+            raise TimeoutError("private body timeout detail")
+        await asyncio.Future()
+        yield b"unreachable"
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -379,6 +393,52 @@ async def test_dns_failure_is_mapped_without_upstream_detail(
     assert "secret" not in str(caught.value)
 
 
+@pytest.mark.asyncio
+async def test_direct_ip_literal_bypasses_system_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    dns_calls = 0
+    requested: list[str] = []
+
+    async def forbidden_dns(*args: object, **kwargs: object) -> list[tuple[Any, ...]]:
+        nonlocal dns_calls
+        dns_calls += 1
+        raise AssertionError("IP literals must not use system DNS")
+
+    async def fake_request(url: object, addresses: tuple[Any, ...]) -> tuple[Any, Any]:
+        requested.append(str(url))
+        assert [address.value for address in addresses] == ["8.8.8.8"]
+        return fake_html_response(), FakeSession()
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", forbidden_dns)
+    monkeypatch.setattr(html_module, "_request_hop", fake_request)
+    result = await fetch_html(url="https://8.8.8.8/path")
+    assert result.final_url == "https://8.8.8.8/path"
+    assert requested == ["https://8.8.8.8/path"]
+    assert dns_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["2130706433", "0177.0.0.1", "0x7f000001"])
+async def test_alternative_numeric_hosts_resolving_non_global_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    requests = 0
+
+    async def fake_getaddrinfo(*args: object, **kwargs: object) -> list[tuple[Any, ...]]:
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    async def forbidden_request(*args: object, **kwargs: object) -> tuple[Any, Any]:
+        nonlocal requests
+        requests += 1
+        raise AssertionError("unsafe numeric host must not be requested")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(html_module, "_request_hop", forbidden_request)
+    with pytest.raises(HtmlFetchError) as caught:
+        await fetch_html(url=f"https://{host}/")
+    assert_fetch_error(caught.value, HtmlFetchErrorCode.DISALLOWED_ADDRESS)
+    assert requests == 0
+
+
 def fake_html_response(
     *, status: int = 200, content_type: str = "text/html", chunks: list[bytes] | None = None
 ) -> FakeResponse:
@@ -448,7 +508,59 @@ async def test_redirect_codes_resolve_and_revalidate_each_hop(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("locations", [[], [""], ["   "], ["/one", "/two"]])
+async def test_redirect_hop_is_reresolved_and_rebinding_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answers = iter(
+        [
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
+        ]
+    )
+    requested: list[str] = []
+
+    async def fake_getaddrinfo(*args: object, **kwargs: object) -> list[tuple[Any, ...]]:
+        return next(answers)
+
+    async def fake_request(url: object, addresses: tuple[Any, ...]) -> tuple[Any, Any]:
+        requested.append(str(url))
+        return FakeResponse(302, headers={"Location": ["/next"]}), FakeSession()
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(html_module, "_request_hop", fake_request)
+    with pytest.raises(HtmlFetchError) as caught:
+        await fetch_html(url="https://example.com/start")
+    assert_fetch_error(caught.value, HtmlFetchErrorCode.DISALLOWED_ADDRESS)
+    assert requested == ["https://example.com/start"]
+
+
+@pytest.mark.asyncio
+async def test_relative_redirect_preserves_resolved_path_and_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = [
+        FakeResponse(302, headers={"Location": ["../final/page?keep=One#drop"]}),
+        fake_html_response(chunks=[b"done"]),
+    ]
+
+    async def fake_resolve(url: object) -> tuple[Any, ...]:
+        return (html_module._admit_ip("8.8.8.8"),)
+
+    async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
+        return responses.pop(0), FakeSession()
+
+    monkeypatch.setattr(html_module, "_resolve", fake_resolve)
+    monkeypatch.setattr(html_module, "_request_hop", fake_request)
+    result = await fetch_html(url="https://example.com/one/two/start?original=yes")
+    assert result.redirect_chain == (
+        "https://example.com/one/two/start?original=yes",
+        "https://example.com/one/final/page?keep=One",
+    )
+    assert result.final_url == "https://example.com/one/final/page?keep=One"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locations", [[], [""], ["   "], ["/one", "/two"], ["https://[malformed"]])
 async def test_invalid_redirect_does_not_read_body(
     monkeypatch: pytest.MonkeyPatch, locations: list[str]
 ) -> None:
@@ -491,6 +603,31 @@ async def test_sixth_redirect_fails_without_requesting_destination(
         await fetch_html(url="https://example.com/0")
     assert_fetch_error(caught.value, HtmlFetchErrorCode.TOO_MANY_REDIRECTS)
     assert requests == 6
+
+
+@pytest.mark.asyncio
+async def test_exactly_five_redirects_can_complete_successfully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = [
+        *[FakeResponse(302, headers={"Location": [f"/{index + 1}"]}) for index in range(5)],
+        fake_html_response(chunks=[b"done"]),
+    ]
+    requested: list[str] = []
+
+    async def fake_resolve(url: object) -> tuple[Any, ...]:
+        return (html_module._admit_ip("8.8.8.8"),)
+
+    async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
+        requested.append(str(url))
+        return responses.pop(0), FakeSession()
+
+    monkeypatch.setattr(html_module, "_resolve", fake_resolve)
+    monkeypatch.setattr(html_module, "_request_hop", fake_request)
+    result = await fetch_html(url="https://example.com/0")
+    assert requested == [f"https://example.com/{index}" for index in range(6)]
+    assert result.redirect_chain == tuple(requested)
+    assert result.body == "done"
 
 
 @pytest.mark.asyncio
@@ -613,6 +750,66 @@ async def test_timeout_is_mapped_and_cancellation_is_never_swallowed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancellation"])
+async def test_active_body_timeout_and_cancellation_close_all_hop_resources(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    started = asyncio.Event()
+    connectors: list[Any] = []
+    sessions: list[Any] = []
+    responses: list[FakeResponse] = []
+
+    class CapturingConnector:
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+            connectors.append(self)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class ActiveSession(FakeSession):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__()
+            self.connector = kwargs["connector"]
+            sessions.append(self)
+
+        async def get(self, url: object, **kwargs: Any) -> FakeResponse:
+            response = fake_html_response()
+            response.content = BlockingContent(started, timeout=not cancel)  # type: ignore[assignment]
+            responses.append(response)
+            return response
+
+        async def close(self) -> None:
+            await super().close()
+            await self.connector.close()
+
+    class DummyJar:
+        pass
+
+    async def fake_resolve(url: object) -> tuple[Any, ...]:
+        return (html_module._admit_ip("8.8.8.8"),)
+
+    monkeypatch.setattr(html_module, "_resolve", fake_resolve)
+    monkeypatch.setattr(html_module.aiohttp, "TCPConnector", CapturingConnector)
+    monkeypatch.setattr(html_module.aiohttp, "ClientSession", ActiveSession)
+    monkeypatch.setattr(html_module.aiohttp, "DummyCookieJar", DummyJar)
+
+    task = asyncio.create_task(fetch_html(url="https://example.com/"))
+    await started.wait()
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(HtmlFetchError) as caught:
+            await task
+        assert_fetch_error(caught.value, HtmlFetchErrorCode.TIMEOUT)
+    assert responses[0].closed
+    assert sessions[0].closed
+    assert connectors[0].closed
+
+
+@pytest.mark.asyncio
 async def test_tls_and_network_failures_are_redacted_and_mapped(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -701,6 +898,31 @@ async def test_request_hop_uses_exact_fail_closed_transport_configuration(
     assert timeout.sock_read == 10
     assert not {"auth", "proxy", "proxy_auth", "ssl", "server_hostname"} & session_kwargs.keys()
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_connector_uses_only_the_pinned_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    system_dns_calls = 0
+
+    async def forbidden_dns(*args: object, **kwargs: object) -> list[tuple[Any, ...]]:
+        nonlocal system_dns_calls
+        system_dns_calls += 1
+        raise AssertionError("connector must not invoke system DNS")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", forbidden_dns)
+    connector = html_module.aiohttp.TCPConnector(
+        resolver=html_module._PinnedResolver((html_module._admit_ip("8.8.8.8"),)),
+        use_dns_cache=False,
+    )
+    try:
+        resolved = await connector._resolve_host("original.example", 443)  # noqa: SLF001
+    finally:
+        await connector.close()
+    assert [item["host"] for item in resolved] == ["8.8.8.8"]
+    assert [item["hostname"] for item in resolved] == ["original.example"]
+    assert system_dns_calls == 0
 
 
 @pytest.mark.asyncio
