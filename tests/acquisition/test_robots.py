@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
+import socket
 import ssl
 from dataclasses import FrozenInstanceError, fields
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,6 +38,20 @@ class FakeContent:
         self.iterated = True
         for chunk in self.chunks:
             yield chunk
+
+
+class BlockingContent:
+    def __init__(self, started: asyncio.Event, *, timeout: bool) -> None:
+        self.started = started
+        self.timeout = timeout
+
+    async def iter_chunked(self, size: int) -> Any:
+        assert size == 64 * 1024
+        self.started.set()
+        if self.timeout:
+            raise TimeoutError("private body timeout detail")
+        await asyncio.Future()
+        yield b"unreachable"
 
 
 class FakeResponse:
@@ -172,6 +189,196 @@ async def test_derives_root_url_and_preserves_normalized_requested_site(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "requested", "robots_url"),
+    [
+        (
+            "HTTP://Example.COM:80/path?q=One#private",
+            "http://example.com/path?q=One",
+            "http://example.com/robots.txt",
+        ),
+        ("https://Example.COM:0443/", "https://example.com/", "https://example.com/robots.txt"),
+        (
+            "https://[2606:4700:4700::1111]:443/a?x=1#drop",
+            "https://[2606:4700:4700::1111]/a?x=1",
+            "https://[2606:4700:4700::1111]/robots.txt",
+        ),
+        (
+            "https://bücher.example/a;b?x=1#drop",
+            "https://xn--bcher-kva.example/a;b?x=1",
+            "https://xn--bcher-kva.example/robots.txt",
+        ),
+    ],
+)
+async def test_initial_url_normalization_matrix_and_root_derivation(
+    monkeypatch: pytest.MonkeyPatch, raw: str, requested: str, robots_url: str
+) -> None:
+    response = FakeResponse(404)
+
+    async def fake_resolve(url: object) -> tuple[Any, ...]:
+        return (robots_module._admit_ip("8.8.8.8"),)
+
+    async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
+        assert str(url) == robots_url
+        return response, FakeSession()
+
+    monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
+    monkeypatch.setattr(robots_module, "_request_hop", fake_request)
+    result = await fetch_robots(site_url=raw)
+    assert result.requested_site_url == requested
+    assert result.robots_url == robots_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "example.com",
+        "//example.com/",
+        "ftp://example.com/",
+        "file:///etc/passwd",
+        "http:///missing-host",
+        "https://user@example.com/",
+        "https://:password@example.com/",
+        "https://user:@example.com/",
+        "https://@example.com/",
+        "https://exa mple.com/",
+        "https://exa mple.com:443/",
+        "https://foo_bar.example/",
+        "https://%65xample.com/",
+        "https://example.com%2e/",
+        "https://a..example/",
+        "https://-foo.example/",
+        "https://foo-.example/",
+        "https://[not-ip]/",
+        "https://[not-ip]:443/",
+        "https://\ud800:443/",
+    ],
+)
+async def test_complete_invalid_initial_url_matrix_fails_before_io(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    async def forbidden(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("invalid URL must fail before I/O")
+
+    monkeypatch.setattr(robots_module, "_resolve", forbidden)
+    monkeypatch.setattr(robots_module, "_request_hop", forbidden)
+    with pytest.raises(RobotsFetchError) as caught:
+        await fetch_robots(site_url=raw)
+    assert_fetch_error(caught.value, RobotsFetchErrorCode.INVALID_URL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "http://example.com:443/",
+        "https://example.com:80/",
+        "https://example.com:0/",
+        "https://example.com:65536/",
+        "https://example.com:not-a-port/",
+        "https://example.com:/",
+        "https://example.com:+443/",
+        "https://example.com:0080/",
+        "https://example.com:\t443/",
+        "https://[2606:4700:4700::1111]:bad/",
+    ],
+)
+async def test_complete_disallowed_initial_port_matrix_fails_before_io(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    async def forbidden(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("invalid port must fail before I/O")
+
+    monkeypatch.setattr(robots_module, "_resolve", forbidden)
+    with pytest.raises(RobotsFetchError) as caught:
+        await fetch_robots(site_url=raw)
+    assert_fetch_error(caught.value, RobotsFetchErrorCode.DISALLOWED_PORT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answers", "code"),
+    [
+        ([], RobotsFetchErrorCode.DNS_FAILURE),
+        (
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+        (
+            [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 443)),
+            ],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+        (
+            [(socket.AF_UNIX, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 443))],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+        (
+            [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_UDP, "", ("8.8.8.8", 443))],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+        (
+            [(socket.AF_INET, socket.SOCK_STREAM)],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+        (
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 80))],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+        (
+            [
+                (
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("2606:4700:4700::1111", 443, 0, 7),
+                )
+            ],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+        (
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("malformed", 443))],
+            RobotsFetchErrorCode.DISALLOWED_ADDRESS,
+        ),
+    ],
+)
+async def test_fetch_robots_rejects_empty_private_mixed_and_malformed_dns_answers(
+    monkeypatch: pytest.MonkeyPatch,
+    answers: list[tuple[Any, ...]],
+    code: RobotsFetchErrorCode,
+) -> None:
+    async def fake_getaddrinfo(*args: object, **kwargs: object) -> list[tuple[Any, ...]]:
+        return answers
+
+    async def forbidden_request(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("unadmitted DNS answers must never be requested")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(robots_module, "_request_hop", forbidden_request)
+    with pytest.raises(RobotsFetchError) as caught:
+        await fetch_robots(site_url="https://example.com/")
+    assert_fetch_error(caught.value, code)
+
+
+@pytest.mark.asyncio
+async def test_fetch_robots_maps_dns_failure_without_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_getaddrinfo(*args: object, **kwargs: object) -> Any:
+        raise socket.gaierror("secret resolver detail")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", failing_getaddrinfo)
+    with pytest.raises(RobotsFetchError) as caught:
+        await fetch_robots(site_url="https://example.com/")
+    assert_fetch_error(caught.value, RobotsFetchErrorCode.DNS_FAILURE)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [204, 301 + 3, 400, 404, 500])
 async def test_terminal_non_200_is_returned_without_reading_body(
     monkeypatch: pytest.MonkeyPatch, status: int
@@ -193,21 +400,33 @@ async def test_terminal_non_200_is_returned_without_reading_body(
 
 
 @pytest.mark.asyncio
-async def test_redirects_are_revalidated_and_chain_tracks_only_requested_urls(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("../next?q=1#drop", "https://example.com/next?q=1"),
+        ("https://example.com/absolute", "https://example.com/absolute"),
+        ("//other.example/cross", "https://other.example/cross"),
+    ],
+)
+async def test_redirect_variants_are_revalidated_and_track_only_requested_urls(
+    monkeypatch: pytest.MonkeyPatch, location: str, expected: str
 ) -> None:
     responses = [
-        FakeResponse(302, headers={"Location": ["//other.example/next#drop"]}),
+        FakeResponse(302, headers={"Location": [location]}),
         FakeResponse(headers={"Content-Type": ["text/plain"]}, chunks=[b"done"]),
     ]
+    all_responses = list(responses)
     resolved: list[str] = []
+    sessions: list[FakeSession] = []
 
     async def fake_resolve(url: object) -> tuple[Any, ...]:
         resolved.append(str(url))
         return (robots_module._admit_ip("8.8.8.8"),)
 
     async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
-        return responses.pop(0), FakeSession()
+        session = FakeSession()
+        sessions.append(session)
+        return responses.pop(0), session
 
     monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
     monkeypatch.setattr(robots_module, "_request_hop", fake_request)
@@ -215,23 +434,57 @@ async def test_redirects_are_revalidated_and_chain_tracks_only_requested_urls(
     assert result.robots_url == "https://example.com/robots.txt"
     assert result.redirect_chain == (
         "https://example.com/robots.txt",
-        "https://other.example/next",
+        expected,
     )
     assert resolved == list(result.redirect_chain)
+    assert all(response.closed for response in all_responses)
+    assert all(session.closed for session in sessions)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("locations", [[], [""], ["/one", "/two"], ["https://[bad"]])
+async def test_redirect_hop_is_reresolved_and_rebinding_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answers = iter(
+        [
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
+        ]
+    )
+    requested: list[str] = []
+    response = FakeResponse(302, headers={"Location": ["/next"]})
+    session = FakeSession()
+
+    async def fake_getaddrinfo(*args: object, **kwargs: object) -> list[tuple[Any, ...]]:
+        return next(answers)
+
+    async def fake_request(url: object, addresses: tuple[Any, ...]) -> tuple[Any, Any]:
+        requested.append(str(url))
+        assert [address.value for address in addresses] == ["8.8.8.8"]
+        return response, session
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(robots_module, "_request_hop", fake_request)
+    with pytest.raises(RobotsFetchError) as caught:
+        await fetch_robots(site_url="https://example.com/start")
+    assert_fetch_error(caught.value, RobotsFetchErrorCode.DISALLOWED_ADDRESS)
+    assert requested == ["https://example.com/robots.txt"]
+    assert response.closed and session.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locations", [[], [""], ["   "], ["/one", "/two"], ["https://[bad"]])
 async def test_invalid_redirect_is_redacted_and_unread(
     monkeypatch: pytest.MonkeyPatch, locations: list[str]
 ) -> None:
     response = FakeResponse(302, headers={"Location": locations}, chunks=[b"secret"])
+    session = FakeSession()
 
     async def fake_resolve(url: object) -> tuple[Any, ...]:
         return (robots_module._admit_ip("8.8.8.8"),)
 
     async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
-        return response, FakeSession()
+        return response, session
 
     monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
     monkeypatch.setattr(robots_module, "_request_hop", fake_request)
@@ -239,6 +492,7 @@ async def test_invalid_redirect_is_redacted_and_unread(
         await fetch_robots(site_url="https://example.com/")
     assert_fetch_error(caught.value, RobotsFetchErrorCode.INVALID_REDIRECT)
     assert not response.content.iterated
+    assert response.closed and session.closed
 
 
 @pytest.mark.asyncio
@@ -246,14 +500,18 @@ async def test_sixth_redirect_fails_before_next_target_is_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses = [FakeResponse(302, headers={"Location": [f"/{i + 1}"]}) for i in range(6)]
+    all_responses = list(responses)
     requested: list[str] = []
+    sessions: list[FakeSession] = []
 
     async def fake_resolve(url: object) -> tuple[Any, ...]:
         return (robots_module._admit_ip("8.8.8.8"),)
 
     async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
         requested.append(str(url))
-        return responses.pop(0), FakeSession()
+        session = FakeSession()
+        sessions.append(session)
+        return responses.pop(0), session
 
     monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
     monkeypatch.setattr(robots_module, "_request_hop", fake_request)
@@ -261,6 +519,8 @@ async def test_sixth_redirect_fails_before_next_target_is_requested(
         await fetch_robots(site_url="https://example.com/start")
     assert_fetch_error(caught.value, RobotsFetchErrorCode.TOO_MANY_REDIRECTS)
     assert len(requested) == 6
+    assert all(response.closed for response in all_responses)
+    assert all(session.closed for session in sessions)
 
 
 @pytest.mark.asyncio
@@ -292,12 +552,13 @@ async def test_content_type_and_charset_are_fail_closed(
     response = FakeResponse(
         headers={} if header is None else {"Content-Type": header}, chunks=[b"x"]
     )
+    session = FakeSession()
 
     async def fake_resolve(url: object) -> tuple[Any, ...]:
         return (robots_module._admit_ip("8.8.8.8"),)
 
     async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
-        return response, FakeSession()
+        return response, session
 
     monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
     monkeypatch.setattr(robots_module, "_request_hop", fake_request)
@@ -305,6 +566,7 @@ async def test_content_type_and_charset_are_fail_closed(
         await fetch_robots(site_url="https://example.com/")
     assert_fetch_error(caught.value, code)
     assert not response.content.iterated
+    assert response.closed and session.closed
 
 
 @pytest.mark.asyncio
@@ -319,8 +581,12 @@ async def test_body_limit_accepts_512000_and_rejects_byte_512001(
     async def fake_resolve(url: object) -> tuple[Any, ...]:
         return (robots_module._admit_ip("8.8.8.8"),)
 
+    sessions: list[FakeSession] = []
+
     async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
-        return responses.pop(0), FakeSession()
+        session = FakeSession()
+        sessions.append(session)
+        return responses.pop(0), session
 
     monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
     monkeypatch.setattr(robots_module, "_request_hop", fake_request)
@@ -328,6 +594,7 @@ async def test_body_limit_accepts_512000_and_rejects_byte_512001(
     with pytest.raises(RobotsFetchError) as caught:
         await fetch_robots(site_url="https://example.com/extra")
     assert_fetch_error(caught.value, RobotsFetchErrorCode.BODY_TOO_LARGE)
+    assert all(session.closed for session in sessions)
 
 
 @pytest.mark.asyncio
@@ -417,3 +684,168 @@ async def test_timeout_tls_network_and_cancellation_mapping(
     monkeypatch.setattr(robots_module, "_fetch", lambda *args: fail(asyncio.CancelledError()))
     with pytest.raises(asyncio.CancelledError):
         await fetch_robots(site_url="https://example.com/")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancellation"])
+async def test_active_body_timeout_and_cancellation_close_all_hop_resources(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    started = asyncio.Event()
+    connectors: list[Any] = []
+    sessions: list[Any] = []
+    responses: list[FakeResponse] = []
+
+    class CapturingConnector:
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+            connectors.append(self)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class ActiveSession(FakeSession):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__()
+            self.connector = kwargs["connector"]
+            sessions.append(self)
+
+        async def get(self, url: object, **kwargs: Any) -> FakeResponse:
+            response = FakeResponse(headers={"Content-Type": ["text/plain"]})
+            response.content = BlockingContent(started, timeout=not cancel)  # type: ignore[assignment]
+            responses.append(response)
+            return response
+
+        async def close(self) -> None:
+            await super().close()
+            await self.connector.close()
+
+    class DummyJar:
+        pass
+
+    async def fake_resolve(url: object) -> tuple[Any, ...]:
+        return (robots_module._admit_ip("8.8.8.8"),)
+
+    monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
+    monkeypatch.setattr(robots_module.aiohttp, "TCPConnector", CapturingConnector)
+    monkeypatch.setattr(robots_module.aiohttp, "ClientSession", ActiveSession)
+    monkeypatch.setattr(robots_module.aiohttp, "DummyCookieJar", DummyJar)
+
+    task = asyncio.create_task(fetch_robots(site_url="https://example.com/"))
+    await started.wait()
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(RobotsFetchError) as caught:
+            await task
+        assert_fetch_error(caught.value, RobotsFetchErrorCode.TIMEOUT)
+    assert responses[0].closed
+    assert sessions[0].closed
+    assert connectors[0].closed
+
+
+@pytest.mark.asyncio
+async def test_request_hop_closes_connector_and_session_on_construction_or_get_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connectors: list[Any] = []
+
+    class CapturingConnector:
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+            connectors.append(self)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FailingConstructor:
+        def __init__(self, **kwargs: Any) -> None:
+            raise RuntimeError("private constructor detail")
+
+    monkeypatch.setattr(robots_module.aiohttp, "TCPConnector", CapturingConnector)
+    monkeypatch.setattr(robots_module.aiohttp, "ClientSession", FailingConstructor)
+    with pytest.raises(RuntimeError):
+        await robots_module._request_hop(
+            robots_module._normalize_url("https://example.com/robots.txt"),
+            (robots_module._admit_ip("8.8.8.8"),),
+        )
+    assert connectors[-1].closed
+
+    sessions: list[FakeSession] = []
+
+    class FailingGetSession(FakeSession):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__()
+            self.connector = kwargs["connector"]
+            sessions.append(self)
+
+        async def get(self, url: object, **kwargs: Any) -> FakeResponse:
+            raise OSError("private socket detail")
+
+        async def close(self) -> None:
+            await super().close()
+            await self.connector.close()
+
+    monkeypatch.setattr(robots_module.aiohttp, "ClientSession", FailingGetSession)
+    with pytest.raises(OSError):
+        await robots_module._request_hop(
+            robots_module._normalize_url("https://example.com/robots.txt"),
+            (robots_module._admit_ip("8.8.8.8"),),
+        )
+    assert sessions[-1].closed
+    assert connectors[-1].closed
+
+
+def test_robots_acquisition_is_statically_isolated_from_forbidden_layers() -> None:
+    acquisition_dir = Path(robots_module.__file__).parent
+    imports: set[str] = set()
+    for path in acquisition_dir.glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imports.add(node.module)
+    forbidden = {
+        "fastapi",
+        "sqlalchemy",
+        "growth_os.api",
+        "growth_os.db",
+        "growth_os.evidence",
+        "growth_os.execution",
+        "growth_os.repositories",
+        "growth_os.robots",
+        "growth_os.services",
+    }
+    assert not any(
+        imported == boundary or imported.startswith(f"{boundary}.")
+        for imported in imports
+        for boundary in forbidden
+    )
+
+    for path in acquisition_dir.parent.rglob("*.py"):
+        if acquisition_dir not in path.parents:
+            source = path.read_text()
+            assert "growth_os.acquisition" not in source
+            assert "fetch_robots" not in source
+
+
+@pytest.mark.asyncio
+async def test_fetch_robots_has_no_logging_or_policy_runtime_integration(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    response = FakeResponse(404, chunks=[b"must remain unread"])
+
+    async def fake_resolve(url: object) -> tuple[Any, ...]:
+        return (robots_module._admit_ip("8.8.8.8"),)
+
+    async def fake_request(url: object, addresses: object) -> tuple[Any, Any]:
+        return response, FakeSession()
+
+    monkeypatch.setattr(robots_module, "_resolve", fake_resolve)
+    monkeypatch.setattr(robots_module, "_request_hop", fake_request)
+    result = await fetch_robots(site_url="https://example.com/private?q=secret")
+    assert result.status_code == 404
+    assert not response.content.iterated
+    assert caplog.records == []
