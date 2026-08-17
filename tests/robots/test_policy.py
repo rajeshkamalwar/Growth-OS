@@ -1,3 +1,5 @@
+import ast
+import inspect
 from dataclasses import FrozenInstanceError, fields
 from enum import StrEnum
 
@@ -10,6 +12,7 @@ from growth_os.robots import (
     RobotsPolicyErrorCode,
     evaluate_robots,
 )
+from growth_os.robots import policy as policy_module
 
 
 def decision(
@@ -296,9 +299,34 @@ def test_no_group_no_rule_and_robots_uri_provenance() -> None:
     ).allowed
 
 
-def test_large_adversarial_input_is_deterministic_and_does_not_log(
+def test_policy_module_has_only_offline_standard_library_dependencies() -> None:
+    imports: set[str] = set()
+    for node in ast.walk(ast.parse(inspect.getsource(policy_module))):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.add(node.module.split(".", 1)[0])
+    assert imports <= {"dataclasses", "enum", "re"}
+
+
+def test_large_adversarial_input_is_deterministic_and_has_no_runtime_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    def reject_side_effect(*args: object, **kwargs: object) -> None:
+        pytest.fail("robots evaluation crossed a prohibited runtime boundary")
+
+    for boundary in (
+        "builtins.open",
+        "logging.Logger._log",
+        "socket.getaddrinfo",
+        "socket.socket",
+        "subprocess.Popen",
+        "subprocess.run",
+        "urllib.request.urlopen",
+    ):
+        monkeypatch.setattr(boundary, reject_side_effect)
+
     robots = (b"User-agent: GrowthOSBot\nDisallow: /*a*a*a*a*a*a*a*a*$\n" * 4_000)[:512_000]
     first = evaluate_robots(robots_txt=robots, target_path="/" + "a" * 5_000)
     second = evaluate_robots(robots_txt=robots, target_path="/" + "a" * 5_000)
