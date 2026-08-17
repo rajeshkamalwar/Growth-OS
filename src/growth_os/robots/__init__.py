@@ -9,6 +9,13 @@ from growth_os.robots.binding import (
     RobotsBindingErrorCode,
     evaluate_bound_robots,
 )
+from growth_os.robots.cache import (
+    RobotsCacheDecision,
+    RobotsCacheError,
+    RobotsCacheErrorCode,
+    RobotsCacheReason,
+    evaluate_robots_cache,
+)
 from growth_os.robots.gate import (
     RobotsGateDecision,
     RobotsGateError,
@@ -30,6 +37,10 @@ __all__ = [
     "RobotsAccessReason",
     "RobotsBindingError",
     "RobotsBindingErrorCode",
+    "RobotsCacheDecision",
+    "RobotsCacheError",
+    "RobotsCacheErrorCode",
+    "RobotsCacheReason",
     "RobotsDecision",
     "RobotsDecisionReason",
     "RobotsGateDecision",
@@ -41,5 +52,6 @@ __all__ = [
     "evaluate_bound_robots",
     "evaluate_robots",
     "evaluate_robots_access",
+    "evaluate_robots_cache",
     "evaluate_robots_gate",
 ]

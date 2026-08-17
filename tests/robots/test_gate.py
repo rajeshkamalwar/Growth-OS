@@ -46,6 +46,10 @@ def test_public_contract_is_exact_exported_and_immutable() -> None:
         "RobotsAccessReason",
         "RobotsBindingError",
         "RobotsBindingErrorCode",
+        "RobotsCacheDecision",
+        "RobotsCacheError",
+        "RobotsCacheErrorCode",
+        "RobotsCacheReason",
         "RobotsDecision",
         "RobotsDecisionReason",
         "RobotsGateDecision",
@@ -57,6 +61,7 @@ def test_public_contract_is_exact_exported_and_immutable() -> None:
         "evaluate_bound_robots",
         "evaluate_robots",
         "evaluate_robots_access",
+        "evaluate_robots_cache",
         "evaluate_robots_gate",
     ]
     assert issubclass(RobotsGateReason, StrEnum)
