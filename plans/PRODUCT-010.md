@@ -1,8 +1,21 @@
 # PRODUCT-010: Offline Robots Access-Outcome Policy
 
-## Status: explicit security approval required
+## Status and Authority
 
-This issue is a proposed runtime contract. Do not apply `codex-ready` or implement it until the user explicitly approves the robots access-outcome policy after its planning proposal is merged.
+**Implementation explicitly approved 2026-08-17 — executable after this planning PR merges and
+the orchestrator re-inspects `main`; separate human implementation-merge approval required.**
+
+This plan preserves the exact runtime contract from
+[GitHub issue #74](https://github.com/rajeshkamalwar/Growth-OS/issues/74). The user explicitly
+approved implementation under that contract on 2026-08-17. The approval becomes executable only
+after planning issue #77's PR merges and the orchestrator re-inspects `main`.
+
+This planning task does not itself queue implementation. Only after the merge and reinspection
+may the orchestrator apply `codex-ready` to issue #74. The approval authorizes only the
+deterministic offline access-outcome interpreter, its tests and verification, and a reviewed draft
+implementation PR. It does not authorize merging that PR, robots.txt retrieval, HTTP/DNS,
+caching, redirects, integration with PRODUCT-008, crawling, scheduling, deployment, production
+traffic, external/customer-facing activity, or weakening or broadening issue #74.
 
 ## Objective
 
@@ -14,7 +27,14 @@ The policy is grounded in [RFC 9309 sections 2.3.1 and 2.4](https://www.rfc-edit
 
 ## Risk and approval boundary
 
-Risk is **high** because status/error semantics determine whether future autonomous network access is permitted. Approval authorizes implementation, tests, verification, and a reviewed draft PR only. It does not authorize merging the implementation, fetching robots.txt, integrating with PRODUCT-008, caching, crawling, scheduling, deployment, production traffic, or any external/customer-facing effect.
+Risk is **high** because status/error semantics determine whether future autonomous network access
+is permitted. Approval authorizes implementation, tests, verification, and a reviewed draft PR
+only. After all gates pass, including a fresh independent protocol/security-focused read-only
+review with zero blocking findings, the implementation PR must not be auto-merged and must remain
+open for a separate explicit human merge decision. Approval does not authorize merging the
+implementation, robots.txt retrieval, HTTP/DNS, caching, redirects, integrating with PRODUCT-008,
+crawling, scheduling, deployment, production traffic, any external/customer-facing effect, or
+weakening or broadening issue #74's contract.
 
 ## Public contract
 
@@ -98,7 +118,11 @@ Run PRODUCT-009 and PRODUCT-010 focused tests, acquisition/evidence regressions,
 
 ## Delivery and rollback
 
-After explicit approval, deliver implementation on a dedicated branch through a reviewed draft PR and stop for a separate human merge decision because this is a material security policy. Do not deploy. Rollback is reverting the implementation commit; no dependency, schema, durable data, production resource, or external state requires recovery.
+After this planning PR merges and the orchestrator re-inspects `main`, deliver implementation on a
+dedicated branch through a reviewed draft PR and stop for a separate human merge decision because
+this is a material security policy. Do not auto-merge or deploy. Rollback is reverting the
+implementation commit; no dependency, schema, durable data, production resource, or external
+state requires recovery.
 
 ## Auto-merge assessment
 
@@ -114,20 +138,23 @@ After explicit approval, deliver implementation on a dedicated branch through a 
 ```
 ## Planning Delivery and Rollback
 
-Planning issue #75 changes exactly `docs/CURRENT-TASK.md` and this new plan. It records a
-proposal only and does not authorize applying `codex-ready` to issue #74, implementation,
-implementation merge, retrieval, caching, crawling, integration, deployment, or external
-activity.
+Planning issue #77 changes exactly `docs/CURRENT-TASK.md` and this plan. It records the user's
+explicit implementation approval but does not itself queue implementation. Only after this
+planning PR merges and the orchestrator re-inspects `main` may the orchestrator apply
+`codex-ready` to issue #74. Neither this planning issue nor its merge authorizes implementation
+merge, robots.txt retrieval, HTTP/DNS, caching, redirects, crawling, integration with PRODUCT-008,
+scheduling, deployment, production traffic, external/customer-facing activity, or weakening or
+broadening issue #74.
 
 Validate documentation format, links, commands, paths, final two-file scope, full repository
 local gates, offline migration rendering, and `git diff --check`. Obtain a fresh independent
 protocol/security-focused read-only review with zero blocking findings, then deliver the planning
 change through a dedicated branch and draft PR.
 
-Planning rollback restores PRODUCT-009 as the recorded current task and removes this proposal. No
-runtime, dependency, schema, data, production resource, or external state requires recovery.
+Planning rollback restores the proposal-only approval gate for PRODUCT-010. No runtime,
+dependency, schema, data, production resource, or external state requires recovery.
 
-The planning issue #75 assessment is:
+The planning issue #77 assessment is:
 
 ```json
 {
@@ -139,3 +166,8 @@ The planning issue #75 assessment is:
   "stop_categories": []
 }
 ```
+
+The planning assessment authorizes only the reversible documentation change. The user's recorded
+approval separately authorizes PRODUCT-010 implementation only after this planning PR merges and
+the orchestrator re-inspects `main`; neither authorization permits any external action or merging
+the implementation PR.
