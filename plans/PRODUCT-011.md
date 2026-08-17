@@ -1,17 +1,28 @@
 # PRODUCT-011: Fail-Closed Robots.txt Acquisition
 
-## Status: Proposed — approval required; not authorized for implementation
+## Status: Approved 2026-08-17 — executable after planning merge/reinspection
 
-This plan preserves the complete proposed contract from
+This plan preserves the complete approved contract from
 [GitHub issue #80](https://github.com/rajeshkamalwar/Growth-OS/issues/80).
 
-Neither planning issue #81 nor its merge authorizes `codex-ready` on issue #80, implementation,
-implementation merge, live retrieval, permission evaluation, crawling, caching, scheduling,
-integration, deployment, or any external activity.
+The user explicitly approved implementation on 2026-08-17. That authorization becomes executable
+only after planning issue #83's PR merges and the orchestrator re-inspects `main`. Planning issue
+#83 itself does not queue implementation; only after that merge and reinspection may the
+orchestrator apply `codex-ready` to issue #80.
 
-## Status: explicit security approval required
+## Authority and mandatory implementation-merge gate
 
-This issue is a proposed outbound-network security contract. Do not apply `codex-ready` or implement it until the user explicitly approves the robots.txt acquisition boundary after its planning proposal is merged.
+Approval authorizes only the explicitly invoked, asynchronous, fail-closed robots.txt acquisition
+primitive, its controlled-fake tests, verification, and a reviewed draft implementation PR under
+issue #80's exact contract. PRODUCT-011 remains **high risk** because it adds outbound HTTP/DNS
+behavior and may refactor the shared PRODUCT-008 SSRF/TLS transport boundary.
+
+The implementation PR must not be auto-merged. It must remain open after all gates and a fresh
+independent SSRF/protocol/security-focused read-only review with zero blocking findings for a
+separate explicit human merge decision. Approval does not authorize implementation merge, live
+retrieval, PRODUCT-010 composition, target-page fetching, crawling, caching, scheduling,
+persistence, runtime integration, deployment, production traffic, or any external/customer-facing
+activity. It does not weaken or broaden issue #80.
 
 ## Objective
 
@@ -156,7 +167,12 @@ Run PRODUCT-008 acquisition regressions, PRODUCT-009/010 tests, all evidence tes
 
 ## Delivery and rollback
 
-After explicit approval, deliver implementation on a dedicated branch through a reviewed draft PR and stop for a separate human merge decision because this changes the outbound-network security boundary. Do not deploy or perform a live request.
+After planning issue #83's PR merges, `main` is re-inspected, and issue #80 receives
+`codex-ready`, deliver implementation on a dedicated branch through a reviewed draft PR. After all
+gates and a fresh independent SSRF/protocol/security-focused read-only review report zero blocking
+findings, leave the implementation PR open and stop for a separate explicit human merge decision
+because this changes the outbound-network security boundary. Do not deploy or perform a live
+request.
 
 Rollback is reverting the implementation commit, restoring PRODUCT-008 internals if refactored, and removing the robots acquisition API/tests. No dependency, schema, durable data, production resource, credential, or external state requires recovery.
 
@@ -175,19 +191,19 @@ Rollback is reverting the implementation commit, restoring PRODUCT-008 internals
 
 ## Planning delivery and rollback
 
-Planning issue #81 changes exactly `docs/CURRENT-TASK.md` and this plan. It records PRODUCT-010
-as merged and PRODUCT-011 as a proposal requiring explicit approval; it does not authorize any
-implementation or external action.
+Planning issue #83 changes exactly `docs/CURRENT-TASK.md` and this plan. It records the user's
+2026-08-17 implementation approval but does not itself queue or implement PRODUCT-011 and does not
+authorize implementation merge or any external action.
 
 Validate documentation/link/command/path hygiene, all repository local gates, offline migration
 rendering, `git diff --check`, and exact two-file scope. Obtain a fresh separate read-only
 SSRF/protocol/security review with zero blocking findings, then deliver the planning change on a
 dedicated branch through a draft PR.
 
-Planning rollback restores PRODUCT-010 as current and removes this PRODUCT-011 proposal. No
-runtime, dependency, schema, data, production, or external recovery is needed.
+Planning rollback reverts issue #83's approval record and restores PRODUCT-011's proposal-only
+gate. No runtime, dependency, schema, data, production, or external recovery is needed.
 
-The planning issue #81 assessment is:
+The planning issue #83 assessment is:
 
 ```json
 {
