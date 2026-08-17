@@ -41,8 +41,11 @@ def fetched(
 
 def test_public_contract_is_exact_exported_and_immutable() -> None:
     assert robots_package.__all__ == [
+        "BoundRobotsDecision",
         "RobotsAccessDecision",
         "RobotsAccessReason",
+        "RobotsBindingError",
+        "RobotsBindingErrorCode",
         "RobotsDecision",
         "RobotsDecisionReason",
         "RobotsGateDecision",
@@ -51,6 +54,7 @@ def test_public_contract_is_exact_exported_and_immutable() -> None:
         "RobotsGateReason",
         "RobotsPolicyError",
         "RobotsPolicyErrorCode",
+        "evaluate_bound_robots",
         "evaluate_robots",
         "evaluate_robots_access",
         "evaluate_robots_gate",
@@ -300,7 +304,11 @@ def test_gate_is_statically_and_runtime_isolated(
 
 def test_gate_has_no_active_runtime_integration() -> None:
     package_root = Path(gate_module.__file__).parents[1]
-    allowed = {Path(gate_module.__file__), Path(robots_package.__file__)}
+    allowed = {
+        Path(gate_module.__file__),
+        Path(robots_package.__file__),
+        Path(gate_module.__file__).with_name("binding.py"),
+    }
     for path in package_root.rglob("*.py"):
         if path not in allowed:
             assert "growth_os.robots.gate" not in path.read_text()

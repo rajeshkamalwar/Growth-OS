@@ -827,7 +827,7 @@ def test_robots_acquisition_is_statically_isolated_from_forbidden_layers() -> No
     for path in acquisition_dir.parent.rglob("*.py"):
         if acquisition_dir not in path.parents:
             source = path.read_text()
-            if path.name != "gate.py" or path.parent.name != "robots":
+            if path.parent.name != "robots" or path.name not in {"binding.py", "gate.py"}:
                 assert "growth_os.acquisition" not in source
             assert "fetch_robots" not in source
 
