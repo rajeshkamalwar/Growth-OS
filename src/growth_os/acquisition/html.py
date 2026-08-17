@@ -125,19 +125,37 @@ def _raw_explicit_port(authority: str) -> str | None:
     return host_port.rsplit(":", 1)[1]
 
 
+def _is_dns_hostname(host: str) -> bool:
+    hostname = host.removesuffix(".")
+    if not hostname or len(hostname) > 253:
+        return False
+    for label in hostname.split("."):
+        if (
+            not label
+            or len(label) > 63
+            or not label.isascii()
+            or not label[0].isalnum()
+            or not label[-1].isalnum()
+            or any(not (character.isalnum() or character == "-") for character in label)
+        ):
+            return False
+    return True
+
+
 def _normalize_url(raw_url: str, *, redirect: bool = False, base: URL | None = None) -> URL:
     error_code = HtmlFetchErrorCode.INVALID_REDIRECT if redirect else HtmlFetchErrorCode.INVALID_URL
     try:
         authority = _raw_authority(raw_url)
         raw_port = _raw_explicit_port(authority) if authority is not None else None
-        if raw_port is not None and (
-            not raw_port.isascii()
-            or not raw_port.isdecimal()
-            or len(raw_port) > 5
-            or str(int(raw_port)) != raw_port
-            or int(raw_port) > 65535
-        ):
-            raise HtmlFetchError(HtmlFetchErrorCode.DISALLOWED_PORT)
+        if raw_port is not None:
+            normalized_port = raw_port.lstrip("0") or "0"
+            if (
+                not raw_port.isascii()
+                or not raw_port.isdecimal()
+                or len(normalized_port) > 5
+                or int(normalized_port) > 65535
+            ):
+                raise HtmlFetchError(HtmlFetchErrorCode.DISALLOWED_PORT)
         parsed = URL(raw_url)
         if base is not None:
             parsed = base.join(parsed)
@@ -151,6 +169,14 @@ def _normalize_url(raw_url: str, *, redirect: bool = False, base: URL | None = N
         ):
             raise HtmlFetchError(error_code)
         parsed = parsed.with_host(parsed.host)
+        normalized_host = parsed.host
+        if normalized_host is None:
+            raise HtmlFetchError(error_code)
+        try:
+            ipaddress.ip_address(normalized_host)
+        except ValueError:
+            if parsed.raw_host is None or not _is_dns_hostname(parsed.raw_host):
+                raise HtmlFetchError(error_code) from None
         try:
             explicit_port = parsed.explicit_port
         except ValueError as exc:
