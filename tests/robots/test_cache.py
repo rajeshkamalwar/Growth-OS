@@ -45,6 +45,7 @@ def assert_invalid(**kwargs: object) -> RobotsCacheError:
 def test_public_contract_is_exact_exported_immutable_and_equality_comparable() -> None:
     assert robots_package.__all__ == [
         "BoundRobotsDecision",
+        "CachedRobotsOutcome",
         "RobotsAccessDecision",
         "RobotsAccessReason",
         "RobotsBindingError",
@@ -53,6 +54,10 @@ def test_public_contract_is_exact_exported_immutable_and_equality_comparable() -
         "RobotsCacheError",
         "RobotsCacheErrorCode",
         "RobotsCacheReason",
+        "RobotsCacheSelectionDecision",
+        "RobotsCacheSelectionError",
+        "RobotsCacheSelectionErrorCode",
+        "RobotsCacheSelectionReason",
         "RobotsDecision",
         "RobotsDecisionReason",
         "RobotsGateDecision",
@@ -66,6 +71,7 @@ def test_public_contract_is_exact_exported_immutable_and_equality_comparable() -
         "evaluate_robots_access",
         "evaluate_robots_cache",
         "evaluate_robots_gate",
+        "select_cached_robots",
     ]
     assert issubclass(RobotsCacheReason, StrEnum)
     assert list(RobotsCacheReason) == [
