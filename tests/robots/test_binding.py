@@ -67,6 +67,7 @@ def assert_binding_error(code: RobotsBindingErrorCode, **kwargs: object) -> Robo
 def test_public_contract_is_exact_exported_immutable_and_equality_comparable() -> None:
     assert robots_package.__all__ == [
         "BoundRobotsDecision",
+        "CachedRobotsOutcome",
         "RobotsAccessDecision",
         "RobotsAccessReason",
         "RobotsBindingError",
@@ -75,6 +76,10 @@ def test_public_contract_is_exact_exported_immutable_and_equality_comparable() -
         "RobotsCacheError",
         "RobotsCacheErrorCode",
         "RobotsCacheReason",
+        "RobotsCacheSelectionDecision",
+        "RobotsCacheSelectionError",
+        "RobotsCacheSelectionErrorCode",
+        "RobotsCacheSelectionReason",
         "RobotsDecision",
         "RobotsDecisionReason",
         "RobotsGateDecision",
@@ -88,6 +93,7 @@ def test_public_contract_is_exact_exported_immutable_and_equality_comparable() -
         "evaluate_robots_access",
         "evaluate_robots_cache",
         "evaluate_robots_gate",
+        "select_cached_robots",
     ]
     assert issubclass(RobotsBindingErrorCode, StrEnum)
     assert [member.value for member in RobotsBindingErrorCode] == [

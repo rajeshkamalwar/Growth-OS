@@ -42,6 +42,7 @@ def fetched(
 def test_public_contract_is_exact_exported_and_immutable() -> None:
     assert robots_package.__all__ == [
         "BoundRobotsDecision",
+        "CachedRobotsOutcome",
         "RobotsAccessDecision",
         "RobotsAccessReason",
         "RobotsBindingError",
@@ -50,6 +51,10 @@ def test_public_contract_is_exact_exported_and_immutable() -> None:
         "RobotsCacheError",
         "RobotsCacheErrorCode",
         "RobotsCacheReason",
+        "RobotsCacheSelectionDecision",
+        "RobotsCacheSelectionError",
+        "RobotsCacheSelectionErrorCode",
+        "RobotsCacheSelectionReason",
         "RobotsDecision",
         "RobotsDecisionReason",
         "RobotsGateDecision",
@@ -63,6 +68,7 @@ def test_public_contract_is_exact_exported_and_immutable() -> None:
         "evaluate_robots_access",
         "evaluate_robots_cache",
         "evaluate_robots_gate",
+        "select_cached_robots",
     ]
     assert issubclass(RobotsGateReason, StrEnum)
     assert list(RobotsGateReason) == [
