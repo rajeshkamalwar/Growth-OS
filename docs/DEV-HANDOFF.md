@@ -106,9 +106,17 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 On every `--once` startup and `--watch` cycle, the controller reconciles an `IMPLEMENTING` or
 `RECOVERABLE_CHANGES` status before requiring a clean tree or selecting another issue. If the
 recorded Codex PID is dead and the exact recorded task branch still contains changes, status
-becomes `RECOVERABLE_CHANGES`. The controller then reloads the exact open, owner-authored GitHub
-issue, runs the full verification suite, and continues with commit, push, draft-PR creation, and
-independent review without rerunning implementation.
+becomes `RECOVERABLE_CHANGES`. Child-output heartbeats record the current changed-path manifest.
+Before recovery stages anything, the controller requires the current dirty paths to match that
+child-captured manifest exactly; missing provenance or added/mixed files stop recovery without
+staging. The controller then reloads the exact open, owner-authored GitHub issue, runs the full
+verification suite, and continues without rerunning implementation.
+
+Commit, push, and draft-PR creation are persisted as explicit finalization checkpoints. Restarted
+recovery verifies the checkpointed commit against `HEAD`, requires a clean tree after commit,
+retries the idempotent branch push when needed, and discovers the branch's unique open draft PR
+before attempting creation. A transient failure after commit, push, or PR creation therefore
+resumes from the completed checkpoint instead of trying to create another commit or PR.
 
 Recovery fails closed when the PID is still live or branch/task identity cannot be proven. A dead
 child with no changes is a clean `FAILED` run. Verification or finalization failure keeps status

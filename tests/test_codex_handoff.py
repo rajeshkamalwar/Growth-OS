@@ -175,6 +175,99 @@ def test_recovery_fails_closed_when_branch_identity_does_not_match(
     assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "RECOVERABLE_CHANGES"
 
 
+def test_recovery_rejects_dirty_files_outside_child_captured_scope(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps({"recoverable_paths": ["devtools/codex_handoff.py"]}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "working_tree_paths",
+        lambda: ["devtools/codex_handoff.py", "operator-notes.txt"],
+    )
+
+    with pytest.raises(RuntimeError, match="working-tree scope"):
+        codex_handoff.validate_recovery_scope()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_absent"),
+    [
+        ("COMMITTED", "git commit"),
+        ("PUSHED", "git push"),
+        ("PR_CREATED", "gh pr create"),
+    ],
+)
+def test_recovery_resumes_from_finalization_checkpoint(
+    checkpoint: str,
+    expected_absent: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _lock_file, status_file = runtime_paths
+    pr_url = "https://github.com/example/repo/pull/1"
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "finalization_checkpoint": checkpoint,
+                "commit_sha": "task-sha",
+                "pr_url": pr_url if checkpoint == "PR_CREATED" else None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    events: list[str] = []
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        events.append(" ".join(args))
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="task-sha\n", stderr="")
+        if args[:3] == ("gh", "pr", "create"):
+            return subprocess.CompletedProcess(args, 0, stdout=f"{pr_url}\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    monkeypatch.setattr(codex_handoff, "run_verification", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "validate_recovery_scope", lambda: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "find_draft_pr",
+        lambda _branch: pr_url if checkpoint in {"PUSHED", "PR_CREATED"} else None,
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_review_fix_loop",
+        lambda *_args: review_result(verdict="pass", findings=[]),
+    )
+    monkeypatch.setattr(codex_handoff, "mark_pr_review_passed", lambda *_args: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "merge_reviewed_pr",
+        lambda *_args: {"merged": False, "reasons": ["recovery"], "sha": None},
+    )
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+
+    codex_handoff.finalize_changes(
+        {"number": 110, "title": "Recover stalled child", "body": "Contract"},
+        {
+            "issue": 110,
+            "title": "Recover stalled child",
+            "branch": "codex/issue-110-recover-stalled-child",
+            "started_at": "now",
+        },
+        tmp_path / "recovery.log",
+        allow_merge=False,
+        recovering=True,
+    )
+
+    assert all(expected_absent not in event for event in events)
+
+
 def test_no_output_child_is_terminated_after_bounded_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -222,15 +315,19 @@ def test_recovery_verifies_and_finalizes_without_rerunning_implementation(
     monkeypatch.setattr(
         codex_handoff,
         "finalize_changes",
-        lambda received_issue, received_context, _log, *, allow_merge: events.append(
-            f"finalize:{received_issue['number']}:{received_context['branch']}:{allow_merge}"
+        lambda received_issue, received_context, _log, *, allow_merge, recovering: events.append(
+            f"finalize:{received_issue['number']}:{received_context['branch']}:{allow_merge}:"
+            f"{recovering}"
         ),
     )
     monkeypatch.setattr(codex_handoff, "comment", lambda *_args: events.append("comment"))
 
     codex_handoff.recover_changes(context)
 
-    assert events == ["comment", "finalize:110:codex/issue-110-recover-stalled-child:False"]
+    assert events == [
+        "comment",
+        "finalize:110:codex/issue-110-recover-stalled-child:False:True",
+    ]
 
 
 def test_failed_child_with_changes_is_recoverable_not_failed(
@@ -1068,7 +1165,7 @@ def test_review_fix_loop_fixes_verifies_commits_and_reviews_again(
     monkeypatch.setattr(
         codex_handoff,
         "commit_review_fix",
-        lambda _issue, fix_round: events.append(("commit", fix_round)),
+        lambda _issue, fix_round, _context: events.append(("commit", fix_round)),
     )
 
     result = codex_handoff.run_review_fix_loop(issue, status_context)
@@ -1293,6 +1390,8 @@ def test_process_issue_does_not_mark_pr_when_review_fails(
             )
         if args[:3] == ("gh", "pr", "edit"):
             pr_marked = True
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="task-sha\n", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     monkeypatch.setattr(codex_handoff, "run", fake_run)

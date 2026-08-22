@@ -360,6 +360,9 @@ def write_status(
     codex_pid: int | None = None,
     last_child_output_at: str | None = None,
     pr_url: str | None = None,
+    recoverable_paths: list[str] | None = None,
+    finalization_checkpoint: str | None = None,
+    commit_sha: str | None = None,
 ) -> None:
     previous: dict[str, object] = {}
     if STATUS_FILE.exists():
@@ -384,6 +387,17 @@ def write_status(
         "log_file": str(log_file) if log_file else previous.get("log_file"),
         "detail": detail,
         "pr_url": pr_url if pr_url is not None else previous.get("pr_url"),
+        "recoverable_paths": (
+            recoverable_paths
+            if recoverable_paths is not None
+            else previous.get("recoverable_paths")
+        ),
+        "finalization_checkpoint": (
+            finalization_checkpoint
+            if finalization_checkpoint is not None
+            else previous.get("finalization_checkpoint")
+        ),
+        "commit_sha": commit_sha if commit_sha is not None else previous.get("commit_sha"),
     }
     STATUS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -439,6 +453,44 @@ def next_issue() -> Issue | None:
     if author != OWNER.lower():
         raise RuntimeError(f"Refusing issue #{issue['number']}: author {author!r} is not {OWNER!r}")
     return issue
+
+
+def working_tree_paths() -> list[str]:
+    """Return every staged, unstaged, deleted, or untracked path deterministically."""
+    raw = run("git", "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+    entries = raw.split("\0")
+    paths: set[str] = set()
+    index = 0
+    while index < len(entries) and entries[index]:
+        entry = entries[index]
+        if len(entry) < 4 or entry[2] != " ":
+            raise RuntimeError("Cannot parse working-tree scope for recovery")
+        paths.add(entry[3:])
+        if "R" in entry[:2] or "C" in entry[:2]:
+            index += 1
+            if index >= len(entries) or not entries[index]:
+                raise RuntimeError("Cannot parse renamed working-tree path for recovery")
+            paths.add(entries[index])
+        index += 1
+    return sorted(paths)
+
+
+def validate_recovery_scope() -> None:
+    """Require the current dirty paths to exactly match the child-captured manifest."""
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("Cannot prove recovery working-tree scope") from exc
+    expected = status.get("recoverable_paths") if isinstance(status, dict) else None
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or any(not isinstance(path, str) or not path for path in expected)
+        or working_tree_paths() != sorted(set(expected))
+    ):
+        raise RuntimeError(
+            "Cannot prove recovery working-tree scope; refusing to stage preserved changes"
+        )
 
 
 def slugify(text: str) -> str:
@@ -538,6 +590,7 @@ def run_codex_stream(
                     codex_pid=None,
                     log_file=log_file,
                     detail=message.strip(),
+                    recoverable_paths=working_tree_paths() or None,
                     **status_context,
                 )
                 return process.returncode, "".join(tail)
@@ -560,10 +613,17 @@ def run_codex_stream(
                 codex_pid=process.pid,
                 log_file=log_file,
                 last_child_output_at=heartbeat,
+                recoverable_paths=working_tree_paths() or None,
                 **status_context,
             )
         return_code = process.wait()
-        write_status(state, codex_pid=None, log_file=log_file, **status_context)
+        write_status(
+            state,
+            codex_pid=None,
+            log_file=log_file,
+            recoverable_paths=working_tree_paths() or None,
+            **status_context,
+        )
     return return_code, "".join(tail)
 
 
@@ -578,6 +638,11 @@ def reconcile_stale_run() -> StatusContext | None:
     if not isinstance(status, dict) or status.get("state") not in {
         "IMPLEMENTING",
         "RECOVERABLE_CHANGES",
+        "COMMITTING",
+        "COMMITTED",
+        "PUSHING",
+        "PUSHED",
+        "PR_CREATED",
     }:
         return None
 
@@ -605,7 +670,9 @@ def reconcile_stale_run() -> StatusContext | None:
             "Cannot prove recovery branch identity: "
             f"status records {branch!r}, checkout is {current_branch!r}"
         )
-    if not run("git", "status", "--porcelain").stdout.strip():
+    has_changes = bool(run("git", "status", "--porcelain").stdout.strip())
+    checkpoint = status.get("finalization_checkpoint")
+    if not has_changes and checkpoint not in {"COMMITTED", "PUSHED", "PR_CREATED"}:
         write_status(
             "FAILED",
             detail="Interrupted Codex implementation left no working-tree changes",
@@ -615,7 +682,7 @@ def reconcile_stale_run() -> StatusContext | None:
 
     write_status(
         "RECOVERABLE_CHANGES",
-        detail="Preserved changes from an interrupted Codex implementation; recovery required",
+        detail="Preserved task work from an interrupted Codex run; recovery required",
         **context,
     )
     return context
@@ -1103,10 +1170,27 @@ repository changes for the controller to verify.
         raise RuntimeError("Reviewer fixer produced no changes")
 
 
-def commit_review_fix(issue: Issue, fix_round: int) -> None:
+def commit_review_fix(issue: Issue, fix_round: int, status_context: StatusContext) -> None:
     run("git", "add", "-A")
     run("git", "commit", "-m", f"codex: address review round {fix_round} for #{issue['number']}")
+    commit_sha = run("git", "rev-parse", "HEAD").stdout.strip()
+    if not commit_sha:
+        raise RuntimeError("Could not record the review-fix commit checkpoint")
+    write_status(
+        "COMMITTED",
+        detail=f"Review fix round {fix_round} committed",
+        finalization_checkpoint="COMMITTED",
+        commit_sha=commit_sha,
+        **status_context,
+    )
     run("git", "push")
+    write_status(
+        "PUSHED",
+        detail=f"Review fix round {fix_round} pushed",
+        finalization_checkpoint="PUSHED",
+        commit_sha=commit_sha,
+        **status_context,
+    )
 
 
 def mark_pr_review_passed(pr_url: str) -> None:
@@ -1124,8 +1208,36 @@ def run_review_fix_loop(issue: Issue, status_context: StatusContext) -> ReviewRe
             raise RuntimeError("Reviewer still found defects after two fix rounds")
         run_fixer(issue, result["findings"], status_context, review_round)
         run_verification(issue, status_context, review_round + 1)
-        commit_review_fix(issue, review_round)
+        commit_review_fix(issue, review_round, status_context)
     raise AssertionError("unreachable review loop state")
+
+
+def find_draft_pr(branch: str) -> str | None:
+    """Discover the single open draft PR for a task branch, if one exists."""
+    payload = gh_json(
+        "pr",
+        "list",
+        "--repo",
+        REPO,
+        "--state",
+        "open",
+        "--head",
+        branch,
+        "--json",
+        "url,isDraft",
+    )
+    if not isinstance(payload, list) or len(payload) > 1:
+        raise RuntimeError("Cannot uniquely identify the recovery draft PR")
+    if not payload:
+        return None
+    pr = payload[0]
+    if (
+        not isinstance(pr, dict)
+        or pr.get("isDraft") is not True
+        or not isinstance(pr.get("url"), str)
+    ):
+        raise RuntimeError("Existing recovery PR is not a proven draft PR")
+    return cast(str, pr["url"])
 
 
 def finalize_changes(
@@ -1134,21 +1246,63 @@ def finalize_changes(
     log_file: Path,
     *,
     allow_merge: bool,
+    recovering: bool = False,
 ) -> None:
     """Verify preserved changes and complete the normal commit/push/draft-PR workflow."""
     number = int(issue["number"])
     title = issue["title"]
     branch = status_context["branch"]
+    status = (
+        json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        if recovering and STATUS_FILE.exists()
+        else {}
+    )
+    checkpoint = status.get("finalization_checkpoint") if isinstance(status, dict) else None
+    commit_sha = status.get("commit_sha") if isinstance(status, dict) else None
+    completed = {"COMMITTED": 1, "PUSHED": 2, "PR_CREATED": 3}.get(str(checkpoint), 0)
+    if recovering:
+        if completed == 0:
+            validate_recovery_scope()
+        elif working_tree_paths():
+            raise RuntimeError("Cannot resume finalization with uncommitted working-tree changes")
     run_verification(issue, status_context, 1)
 
-    write_status(
-        "COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context
-    )
-    run("git", "add", "-A")
-    run("git", "commit", "-m", f"codex: resolve issue #{number}")
+    if completed == 0:
+        write_status(
+            "COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context
+        )
+        run("git", "add", "-A")
+        run("git", "commit", "-m", f"codex: resolve issue #{number}")
+        commit_sha = run("git", "rev-parse", "HEAD").stdout.strip()
+        if not commit_sha:
+            raise RuntimeError("Could not record the recovery commit checkpoint")
+        write_status(
+            "COMMITTED",
+            log_file=log_file,
+            detail="Codex changes committed",
+            finalization_checkpoint="COMMITTED",
+            commit_sha=commit_sha,
+            **status_context,
+        )
+        completed = 1
+    elif (
+        not isinstance(commit_sha, str)
+        or run("git", "rev-parse", "HEAD").stdout.strip() != commit_sha
+    ):
+        raise RuntimeError("Recovery commit checkpoint does not match the current HEAD")
 
-    write_status("PUSHING", log_file=log_file, detail="Pushing task branch", **status_context)
-    run("git", "push", "-u", "origin", branch)
+    if completed < 2:
+        write_status("PUSHING", log_file=log_file, detail="Pushing task branch", **status_context)
+        run("git", "push", "-u", "origin", branch)
+        write_status(
+            "PUSHED",
+            log_file=log_file,
+            detail="Task branch pushed",
+            finalization_checkpoint="PUSHED",
+            commit_sha=commit_sha,
+            **status_context,
+        )
+        completed = 2
 
     pr_body = (
         f"Automated local Codex handoff for #{number}.\n\nCloses #{number}.\n\n"
@@ -1156,25 +1310,38 @@ def finalize_changes(
         "It must pass independent review and the bounded merge policy before merge. "
         "No production deployment is authorized."
     )
-    pr_url = run(
-        "gh",
-        "pr",
-        "create",
-        "--repo",
-        REPO,
-        "--base",
-        "main",
-        "--head",
-        branch,
-        "--draft",
-        "--title",
-        title,
-        "--body",
-        pr_body,
-    ).stdout.strip()
+    pr_url = find_draft_pr(branch) if recovering else None
+    recorded_pr = status.get("pr_url") if isinstance(status, dict) else None
+    if completed >= 3 and (not isinstance(recorded_pr, str) or pr_url != recorded_pr):
+        raise RuntimeError("Recovery draft PR checkpoint cannot be proven")
+    if pr_url is None:
+        pr_url = run(
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            REPO,
+            "--base",
+            "main",
+            "--head",
+            branch,
+            "--draft",
+            "--title",
+            title,
+            "--body",
+            pr_body,
+        ).stdout.strip()
+        if not pr_url:
+            raise RuntimeError("GitHub did not return the created draft PR URL")
 
     write_status(
-        "PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context
+        "PR_CREATED",
+        log_file=log_file,
+        detail="Draft PR opened",
+        pr_url=pr_url,
+        finalization_checkpoint="PR_CREATED",
+        commit_sha=commit_sha,
+        **status_context,
     )
     comment(number, f"Codex opened a draft PR for independent review: {pr_url}")
     run_review_fix_loop(issue, status_context)
@@ -1251,7 +1418,7 @@ def recover_changes(status_context: StatusContext) -> None:
     log_file = LOG_DIR / f"recovery-{number}.log"
     comment(number, "Recovering preserved task changes without rerunning implementation.")
     try:
-        finalize_changes(issue, status_context, log_file, allow_merge=False)
+        finalize_changes(issue, status_context, log_file, allow_merge=False, recovering=True)
     except Exception as exc:
         write_status(
             "RECOVERABLE_CHANGES",
