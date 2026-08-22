@@ -363,6 +363,7 @@ def write_status(
     recoverable_paths: list[str] | None = None,
     finalization_checkpoint: str | None = None,
     commit_sha: str | None = None,
+    reset_recovery: bool = False,
 ) -> None:
     previous: dict[str, object] = {}
     if STATUS_FILE.exists():
@@ -370,6 +371,7 @@ def write_status(
             previous = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             previous = {}
+    recovery_previous = {} if reset_recovery else previous
     payload = {
         "state": state,
         "issue": issue if issue is not None else previous.get("issue"),
@@ -382,22 +384,24 @@ def write_status(
         "last_child_output_at": (
             last_child_output_at
             if last_child_output_at is not None
-            else previous.get("last_child_output_at")
+            else recovery_previous.get("last_child_output_at")
         ),
         "log_file": str(log_file) if log_file else previous.get("log_file"),
         "detail": detail,
-        "pr_url": pr_url if pr_url is not None else previous.get("pr_url"),
+        "pr_url": pr_url if pr_url is not None else recovery_previous.get("pr_url"),
         "recoverable_paths": (
             recoverable_paths
             if recoverable_paths is not None
-            else previous.get("recoverable_paths")
+            else recovery_previous.get("recoverable_paths")
         ),
         "finalization_checkpoint": (
             finalization_checkpoint
             if finalization_checkpoint is not None
-            else previous.get("finalization_checkpoint")
+            else recovery_previous.get("finalization_checkpoint")
         ),
-        "commit_sha": commit_sha if commit_sha is not None else previous.get("commit_sha"),
+        "commit_sha": (
+            commit_sha if commit_sha is not None else recovery_previous.get("commit_sha")
+        ),
     }
     STATUS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -565,6 +569,7 @@ def run_codex_stream(
             codex_pid=process.pid,
             log_file=log_file,
             last_child_output_at=heartbeat,
+            reset_recovery=state in {"IMPLEMENTING", "FIXING"},
             **status_context,
         )
         assert process.stdin is not None
@@ -637,6 +642,7 @@ def reconcile_stale_run() -> StatusContext | None:
         raise RuntimeError("Handoff status is unreadable; refusing startup recovery") from exc
     if not isinstance(status, dict) or status.get("state") not in {
         "IMPLEMENTING",
+        "FIXING",
         "RECOVERABLE_CHANGES",
         "COMMITTING",
         "COMMITTED",
@@ -661,7 +667,7 @@ def reconcile_stale_run() -> StatusContext | None:
         "started_at": cast(str, started_at),
     }
     pid = status.get("codex_pid")
-    if status["state"] == "IMPLEMENTING" and type(pid) is int and pid_is_running(pid):
+    if status["state"] in {"IMPLEMENTING", "FIXING"} and type(pid) is int and pid_is_running(pid):
         raise RuntimeError(f"Recorded Codex PID {pid} is still running; refusing recovery")
 
     current_branch = run("git", "branch", "--show-current").stdout.strip()
@@ -686,6 +692,35 @@ def reconcile_stale_run() -> StatusContext | None:
         **context,
     )
     return context
+
+
+def establish_recovery_manifest(status_context: StatusContext) -> None:
+    """Capture legacy dirty scope only after branch and issue ownership have been proven."""
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("Cannot prove recovery status before capturing scope") from exc
+    if not isinstance(status, dict) or any(
+        status.get(field) != value for field, value in status_context.items()
+    ):
+        raise RuntimeError("Cannot prove recovery task identity before capturing scope")
+    existing = status.get("recoverable_paths")
+    if existing is not None:
+        return
+    if status.get("finalization_checkpoint") in {"COMMITTED", "PUSHED", "PR_CREATED"}:
+        return
+    current_branch = run("git", "branch", "--show-current").stdout.strip()
+    if current_branch != status_context["branch"]:
+        raise RuntimeError("Cannot prove recovery branch identity before capturing scope")
+    paths = working_tree_paths()
+    if not paths:
+        raise RuntimeError("Cannot establish recovery scope without working-tree changes")
+    write_status(
+        "RECOVERABLE_CHANGES",
+        recoverable_paths=paths,
+        detail="Captured preserved task paths after proving legacy recovery ownership",
+        **status_context,
+    )
 
 
 def _review_result_error(detail: str) -> RuntimeError:
@@ -1165,6 +1200,18 @@ repository changes for the controller to verify.
 """
     return_code, output_tail = run_codex_stream(prompt, log_file, status_context, state="FIXING")
     if return_code != 0:
+        paths = working_tree_paths()
+        if paths:
+            write_status(
+                "RECOVERABLE_CHANGES",
+                log_file=log_file,
+                detail=f"Fixer exited with {return_code}; preserved changes require recovery",
+                recoverable_paths=paths,
+                **status_context,
+            )
+            raise RecoverableChangesError(
+                f"Fixer exited with {return_code}; preserved task changes require recovery"
+            )
         raise RuntimeError(f"Fixer exited with {return_code}:\n{output_tail[-3000:]}")
     if not run("git", "status", "--porcelain").stdout.strip():
         raise RuntimeError("Reviewer fixer produced no changes")
@@ -1414,6 +1461,7 @@ def load_recovery_issue(status_context: StatusContext) -> Issue:
 def recover_changes(status_context: StatusContext) -> None:
     """Finalize preserved implementation work without invoking Codex implementation again."""
     issue = load_recovery_issue(status_context)
+    establish_recovery_manifest(status_context)
     number = status_context["issue"]
     log_file = LOG_DIR / f"recovery-{number}.log"
     comment(number, "Recovering preserved task changes without rerunning implementation.")
@@ -1442,7 +1490,13 @@ def process_issue(issue: Issue) -> None:
         "started_at": started_at,
     }
 
-    write_status("SYNCING", log_file=log_file, detail="Preparing task branch", **status_context)
+    write_status(
+        "SYNCING",
+        log_file=log_file,
+        detail="Preparing task branch",
+        reset_recovery=True,
+        **status_context,
+    )
     label(number, add=RUNNING_LABEL, remove=READY_LABEL)
     comment(number, f"Local Codex controller started this task on branch `{branch}`.")
     prepare_task_branch(branch)
@@ -1482,11 +1536,13 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
 
     return_code, output_tail = run_codex_stream(prompt, log_file, status_context)
     if return_code != 0:
-        if run("git", "status", "--porcelain").stdout.strip():
+        paths = working_tree_paths()
+        if paths:
             write_status(
                 "RECOVERABLE_CHANGES",
                 log_file=log_file,
                 detail=f"Codex exited with {return_code}; preserved changes require recovery",
+                recoverable_paths=paths,
                 **status_context,
             )
             raise RecoverableChangesError(

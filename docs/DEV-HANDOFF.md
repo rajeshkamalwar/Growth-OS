@@ -103,14 +103,16 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 
 ## Interrupted-child recovery
 
-On every `--once` startup and `--watch` cycle, the controller reconciles an `IMPLEMENTING` or
-`RECOVERABLE_CHANGES` status before requiring a clean tree or selecting another issue. If the
-recorded Codex PID is dead and the exact recorded task branch still contains changes, status
-becomes `RECOVERABLE_CHANGES`. Child-output heartbeats record the current changed-path manifest.
-Before recovery stages anything, the controller requires the current dirty paths to match that
-child-captured manifest exactly; missing provenance or added/mixed files stop recovery without
-staging. The controller then reloads the exact open, owner-authored GitHub issue, runs the full
-verification suite, and continues without rerunning implementation.
+On every `--once` startup and `--watch` cycle, the controller reconciles an `IMPLEMENTING`,
+`FIXING`, or `RECOVERABLE_CHANGES` status before requiring a clean tree or selecting another
+issue. If the recorded workspace-write Codex PID is dead and the exact recorded task branch still
+contains changes, status becomes `RECOVERABLE_CHANGES`. Child-output heartbeats record the current
+changed-path manifest. Before recovery stages anything, the controller requires the current dirty
+paths to match that child-captured manifest exactly. For legacy/pre-heartbeat status that has no
+manifest, the controller captures the current dirty paths only after both the recorded branch and
+the exact open, owner-authored issue have been proven; added or mixed files after that capture stop
+recovery without staging. The controller then runs the full verification suite and continues
+without rerunning implementation or a review-fix round.
 
 Commit, push, and draft-PR creation are persisted as explicit finalization checkpoints. Restarted
 recovery verifies the checkpointed commit against `HEAD`, requires a clean tree after commit,
@@ -122,7 +124,9 @@ Recovery fails closed when the PID is still live or branch/task identity cannot 
 child with no changes is a clean `FAILED` run. Verification or finalization failure keeps status
 at `RECOVERABLE_CHANGES`, preserves the task branch and files, releases the controller lock, and
 prevents another issue from starting. Recovery never auto-merges; its reviewed draft PR remains
-open for human handling.
+open for human handling. Starting a new task and starting a workspace-write fix round clear prior
+task/finalization recovery checkpoints so a later child failure cannot inherit another task or an
+already-completed phase.
 
 An issue opts into merge evaluation with exactly one assessment block:
 
