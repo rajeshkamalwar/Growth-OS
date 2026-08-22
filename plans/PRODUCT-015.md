@@ -1,8 +1,8 @@
 # PRODUCT-015: Cached Robots Outcome Selector
 
-## Status: explicit security approval required
+## Status: approved — executable only after planning merge and `main` reinspection
 
-This issue proposes a material security-policy composition contract. Do not apply `codex-ready` or implement it until its planning proposal is merged and the user explicitly approves this exact offline selector.
+On 2026-08-17, the user explicitly approved implementation of this exact material security-policy composition contract. The approval becomes executable only after the planning PR for issue #107 merges and the orchestrator re-inspects `main`. Planning issue #107 does not itself queue implementation; only after that merge and reinspection may the orchestrator apply `codex-ready` to issue #104.
 
 ## Objective
 
@@ -12,7 +12,7 @@ This milestone performs no clock read, cache/backend/file/database access, HTTP/
 
 ## Risk and approval boundary
 
-Risk is **high** because selecting a cached robots acquisition outcome can affect future crawl authorization. Approval would authorize implementation, values-only tests, verification, and a reviewed draft PR only. It would not authorize implementation merge, cached-value storage or retrieval, stale-on-error reuse, live retrieval, binding, permission evaluation, crawling, scheduling, persistence, tenant/site database integration, audit, deployment, production traffic, or any external/customer-facing effect.
+Risk is **high** because selecting a cached robots acquisition outcome can affect future crawl authorization. After the planning merge and `main` reinspection, approval authorizes only the deterministic, synchronous, offline cached-outcome selector, its values-only tests, verification, and a reviewed draft implementation PR under issue #104's exact contract. The implementation PR must not be auto-merged and must remain open after all gates and a fresh independent cache/time/protocol/security-focused read-only review with zero blocking findings for a separate explicit human merge decision. Approval does not authorize implementation merge, cache storage or retrieval, stale-on-error reuse, clock access, live retrieval, site/target binding, robots permission evaluation, crawling, scheduling, persistence, tenant/site database integration, audit or runtime integration, deployment, production traffic, or any external/customer-facing activity. It does not authorize weakening or broadening issue #104.
 
 ## Public contract
 
@@ -92,7 +92,7 @@ Run focused cache-selection/robots/acquisition/evidence tests, full pytest, Ruff
 
 ## Delivery and rollback
 
-After explicit approval, deliver on a dedicated branch through a reviewed draft PR and stop for a separate explicit human merge decision. Do not deploy or perform any live request.
+After the planning PR for issue #107 merges and the orchestrator re-inspects `main`, deliver implementation on a dedicated branch through a reviewed draft PR and stop for a separate explicit human merge decision. Do not auto-merge the implementation PR, deploy, or perform any live request.
 
 Rollback removes the selector API/tests. No dependency, schema, durable data, production resource, credential, or external state requires recovery.
 
@@ -111,7 +111,7 @@ Rollback removes the selector API/tests. No dependency, schema, durable data, pr
 
 ## Planning authorization boundary
 
-This planning issue is documentation only. It does not authorize `codex-ready` on #104, implementation, implementation merge, cache storage/retrieval, stale fallback, clock access, live retrieval, site/target binding, permission evaluation, crawling, scheduling, persistence, tenant/site database integration, audit, runtime integration, deployment, production traffic, or external/customer-facing activity.
+Planning issue #107 is documentation only and does not itself queue implementation. The orchestrator may apply `codex-ready` to issue #104 only after this planning PR merges and `main` is re-inspected. Approval does not authorize implementation before those conditions, implementation merge, cache storage or retrieval, stale-on-error reuse, clock access, live retrieval, site/target binding, robots permission evaluation, crawling, scheduling, persistence, tenant/site database integration, audit or runtime integration, deployment, production traffic, or external/customer-facing activity. It does not weaken any public-contract, exact-type, validation-ordering, one-call delegation, identity, boundary, isolation, acceptance, future-gate, non-action, or rollback requirement above.
 
 Validate documentation format, links, commands, paths, exact two-file scope, full repository gates, offline Alembic upgrade/downgrade rendering, and `git diff --check`. Obtain a fresh separate read-only cache/time/protocol/security review with zero blocking findings. Deliver through a dedicated branch and draft PR.
 
