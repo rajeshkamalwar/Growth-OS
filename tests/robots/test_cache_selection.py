@@ -1,7 +1,7 @@
 import ast
 import inspect
 from dataclasses import FrozenInstanceError, fields
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 
@@ -126,6 +126,17 @@ class DatetimeSubclass(datetime):
 
 class FetchedSubclass(FetchedRobots):
     pass
+
+
+class ZeroOffsetTimezone(tzinfo):
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "UTC"
 
 
 class OutcomeDuck:
@@ -285,6 +296,54 @@ def test_missing_and_expired_drop_fetched_object(
 )
 def test_forged_cache_decisions_fail_closed(
     monkeypatch: pytest.MonkeyPatch, forged: object
+) -> None:
+    monkeypatch.setattr(selection_module, "evaluate_robots_cache", lambda **kwargs: forged)
+    assert_invalid(cached_outcome=outcome(), now=NOW)
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        RobotsCacheDecision(
+            True,
+            RobotsCacheReason.FRESH,
+            datetime(2026, 8, 17, 12, tzinfo=UTC),
+            STORED_AT + timedelta(hours=24),
+        ),
+        RobotsCacheDecision(
+            True,
+            RobotsCacheReason.FRESH,
+            datetime(2026, 8, 17, 12),
+            STORED_AT + timedelta(hours=24),
+        ),
+        RobotsCacheDecision(
+            True,
+            RobotsCacheReason.FRESH,
+            datetime(2026, 8, 17, 12, tzinfo=ZeroOffsetTimezone()),
+            STORED_AT + timedelta(hours=24),
+        ),
+        RobotsCacheDecision(
+            True,
+            RobotsCacheReason.FRESH,
+            STORED_AT,
+            STORED_AT + timedelta(hours=23),
+        ),
+        RobotsCacheDecision(
+            True,
+            RobotsCacheReason.FRESH,
+            STORED_AT,
+            datetime(2026, 8, 18, 12),
+        ),
+        RobotsCacheDecision(
+            False,
+            RobotsCacheReason.EXPIRED,
+            STORED_AT,
+            STORED_AT + timedelta(hours=24),
+        ),
+    ],
+)
+def test_forged_cache_timestamp_invariants_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, forged: RobotsCacheDecision
 ) -> None:
     monkeypatch.setattr(selection_module, "evaluate_robots_cache", lambda **kwargs: forged)
     assert_invalid(cached_outcome=outcome(), now=NOW)

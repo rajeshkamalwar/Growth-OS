@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 
 from growth_os.acquisition.robots import FetchedRobots
@@ -47,23 +47,39 @@ def _invalid_input() -> RobotsCacheSelectionError:
     return RobotsCacheSelectionError(RobotsCacheSelectionErrorCode.INVALID_INPUT)
 
 
-def _valid_cache_decision(decision: object) -> bool:
+def _is_canonical_utc(value: object) -> bool:
+    return type(value) is datetime and value.tzinfo is timezone.utc  # noqa: UP017
+
+
+def _valid_cache_decision(decision: object, *, stored_at: datetime | None, now: datetime) -> bool:
     if type(decision) is not RobotsCacheDecision or type(decision.reusable) is not bool:
         return False
-    if decision.reason is RobotsCacheReason.FRESH:
-        return (
-            decision.reusable
-            and type(decision.stored_at) is datetime
-            and type(decision.expires_at) is datetime
-        )
+    if not _is_canonical_utc(now):
+        return False
     if decision.reason is RobotsCacheReason.MISSING:
-        return not decision.reusable and decision.stored_at is None and decision.expires_at is None
-    if decision.reason is RobotsCacheReason.EXPIRED:
         return (
-            not decision.reusable
-            and type(decision.stored_at) is datetime
-            and type(decision.expires_at) is datetime
+            stored_at is None
+            and not decision.reusable
+            and decision.stored_at is None
+            and decision.expires_at is None
         )
+    if not _is_canonical_utc(stored_at) or decision.stored_at is not stored_at:
+        return False
+    assert type(stored_at) is datetime
+    expires_at = decision.expires_at
+    if not _is_canonical_utc(expires_at):
+        return False
+    assert type(expires_at) is datetime
+    try:
+        expected_expires_at = stored_at + timedelta(hours=24)
+    except OverflowError:
+        return False
+    if expires_at != expected_expires_at:
+        return False
+    if decision.reason is RobotsCacheReason.FRESH:
+        return decision.reusable and now < expires_at
+    if decision.reason is RobotsCacheReason.EXPIRED:
+        return not decision.reusable and now >= expires_at
     return False
 
 
@@ -82,7 +98,7 @@ def select_cached_robots(
 
     stored_at = None if cached_outcome is None else cached_outcome.stored_at
     cache_decision = evaluate_robots_cache(stored_at=stored_at, now=now)
-    if not _valid_cache_decision(cache_decision):
+    if not _valid_cache_decision(cache_decision, stored_at=stored_at, now=now):
         raise _invalid_input()
 
     if (cached_outcome is None) is not (cache_decision.reason is RobotsCacheReason.MISSING):
