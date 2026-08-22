@@ -1,7 +1,10 @@
+import fcntl
 import importlib.util
 import json
 import os
 import subprocess
+import sys
+import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -42,15 +45,41 @@ def test_poll_interval_rejects_invalid_or_unbounded_values(value: str) -> None:
         codex_handoff.poll_interval(value)
 
 
+def test_audit_comments_are_idempotent_across_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    comments: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        codex_handoff,
+        "gh_json",
+        lambda *_args: {"comments": list(comments)},
+    )
+
+    def publish(_issue: int, body: str) -> None:
+        comments.append({"body": body})
+
+    monkeypatch.setattr(codex_handoff, "comment", publish)
+
+    for _attempt in range(2):
+        codex_handoff.comment_once(110, "recovery-started", "Recovering work")
+        codex_handoff.comment_once(110, "draft-pr-opened", "Draft PR opened")
+        codex_handoff.comment_once(110, "independent-review-passed", "Review passed")
+
+    assert len(comments) == 3
+    assert sum("recovery-started" in item["body"] for item in comments) == 1
+    assert sum("draft-pr-opened" in item["body"] for item in comments) == 1
+    assert sum("independent-review-passed" in item["body"] for item in comments) == 1
+
+
 def test_live_controller_lock_blocks_second_controller(
     monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
 ) -> None:
     lock_file, _status_file = runtime_paths
-    lock_file.write_text("4242", encoding="utf-8")
-    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda pid: pid == 4242)
+    with lock_file.open("w+", encoding="utf-8") as owner:
+        owner.write("4242")
+        owner.flush()
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-    with pytest.raises(RuntimeError, match="active controller PID 4242"):
-        codex_handoff.acquire_lock()
+        with pytest.raises(RuntimeError, match="active controller PID 4242"):
+            codex_handoff.acquire_lock()
 
     assert lock_file.read_text(encoding="utf-8") == "4242"
 
@@ -68,6 +97,2061 @@ def test_stale_or_malformed_controller_lock_is_recovered(
     codex_handoff.acquire_lock()
 
     assert lock_file.read_text(encoding="utf-8") == str(os.getpid())
+
+
+def test_reused_live_pid_in_unlocked_stale_file_does_not_block_controller(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, _status_file = runtime_paths
+    lock_file.write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda pid: pid == 4242)
+
+    codex_handoff.acquire_lock()
+
+    assert lock_file.read_text(encoding="utf-8") == str(os.getpid())
+
+
+def test_dead_legacy_implementing_pid_with_changes_requires_confirmation(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "codex_pid": 999999,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs: dict[tuple[str, ...], str] = {
+            ("git", "branch", "--show-current"): "codex/issue-110-recover-stalled-child\n",
+            ("git", "status", "--porcelain"): " M docs/DEV-HANDOFF.md\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="explicit operator confirmation"):
+        codex_handoff.reconcile_stale_run()
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == (
+        "RECOVERY_CONFIRMATION_REQUIRED"
+    )
+
+
+@pytest.mark.parametrize("state", ["IMPLEMENTING", "FIXING", "REVIEWING"])
+def test_recovery_refuses_a_live_pid_without_process_group_provenance(
+    state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": state,
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "codex_pid": 4242,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda pid: pid == 4242)
+
+    with pytest.raises(RuntimeError, match="Cannot prove live orphaned"):
+        codex_handoff.reconcile_stale_run()
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "RECOVERY_BLOCKED"
+
+
+def test_recovery_does_not_signal_unprovable_group_after_leader_exits(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "codex_pid": 4242,
+                "child_process_group": 4242,
+                "child_process_identity": "4242 recorded identity",
+                "last_child_output_at": "2026-08-22T00:00:00+00:00",
+                "child_inactivity_timeout": 60,
+                "recoverable_base_sha": "base-sha",
+                "recoverable_paths": ["devtools/codex_handoff.py"],
+                "recoverable_snapshot": "captured",
+                **context,
+            }
+        ),
+        encoding="utf-8",
+    )
+    running = True
+    terminated = False
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+    monkeypatch.setattr(
+        codex_handoff, "process_group_identity", lambda pid: "4242 recorded identity"
+    )
+    monkeypatch.setattr(codex_handoff, "heartbeat_is_stale", lambda *_args: True)
+    monkeypatch.setattr(codex_handoff, "process_group_is_running", lambda pid: running)
+    monkeypatch.setattr(
+        codex_handoff,
+        "captured_recovery_scope",
+        lambda: (["devtools/codex_handoff.py"], "captured-after-stop"),
+    )
+
+    def terminate(pid: int, _grace: float) -> None:
+        nonlocal terminated
+        terminated = True
+
+    monkeypatch.setattr(codex_handoff, "terminate_orphan_process_group", terminate)
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs = {
+            ("git", "branch", "--show-current"): f"{context['branch']}\n",
+            ("git", "status", "--porcelain"): " M devtools/codex_handoff.py\n",
+            ("git", "rev-parse", "HEAD"): "base-sha\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="Recovery blocked"):
+        codex_handoff.reconcile_stale_run()
+
+    assert terminated is False
+    assert running is True
+    blocked = json.loads(status_file.read_text(encoding="utf-8"))
+    assert blocked["state"] == "RECOVERY_BLOCKED"
+    assert blocked["codex_pid"] == 4242
+    running = False
+
+    with pytest.raises(RuntimeError, match="explicit operator confirmation"):
+        codex_handoff.reconcile_stale_run()
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == (
+        "RECOVERY_CONFIRMATION_REQUIRED"
+    )
+
+
+def test_recovery_terminates_identity_proven_stale_live_group(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "codex_pid": 4242,
+                "child_process_group": 4242,
+                "child_process_identity": "4242 recorded identity",
+                "last_child_output_at": "2026-08-22T00:00:00+00:00",
+                "child_inactivity_timeout": 60,
+                "recoverable_base_sha": "base-sha",
+                **context,
+            }
+        ),
+        encoding="utf-8",
+    )
+    running = True
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: running)
+    monkeypatch.setattr(codex_handoff, "process_group_is_running", lambda _group: running)
+    monkeypatch.setattr(
+        codex_handoff, "process_group_identity", lambda _pid: "4242 recorded identity"
+    )
+    monkeypatch.setattr(codex_handoff, "heartbeat_is_stale", lambda *_args: True)
+
+    def terminate(_group: int, _grace: float) -> None:
+        nonlocal running
+        running = False
+
+    monkeypatch.setattr(codex_handoff, "terminate_orphan_process_group", terminate)
+    monkeypatch.setattr(
+        codex_handoff, "captured_recovery_scope", lambda: (["changed.py"], "snapshot")
+    )
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs = {
+            ("git", "branch", "--show-current"): f"{context['branch']}\n",
+            ("git", "rev-parse", "HEAD"): "base-sha\n",
+            ("git", "status", "--porcelain"): " M changed.py\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="explicit operator confirmation"):
+        codex_handoff.reconcile_stale_run()
+    assert running is False
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == (
+        "RECOVERY_CONFIRMATION_REQUIRED"
+    )
+
+
+def test_dead_instrumented_child_requires_confirmation_then_reaches_finalization(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    issue = {"number": 110, "title": "Recover stalled child", "body": "Contract"}
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "codex_pid": 4242,
+                "child_process_group": 4242,
+                "child_process_identity": "4242 recorded identity",
+                "last_child_output_at": "2026-08-22T00:00:00+00:00",
+                "child_inactivity_timeout": 60,
+                "recoverable_base_sha": "base-sha",
+                **context,
+            }
+        ),
+        encoding="utf-8",
+    )
+    paths = ["changed.py"]
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+    monkeypatch.setattr(codex_handoff, "process_group_is_running", lambda _group: False)
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: paths)
+    monkeypatch.setattr(codex_handoff, "recovery_snapshot", lambda _paths: "captured-snapshot")
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs = {
+            ("git", "branch", "--show-current"): f"{context['branch']}\n",
+            ("git", "rev-parse", "HEAD"): "base-sha\n",
+            ("git", "status", "--porcelain"): " M changed.py\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    with pytest.raises(RuntimeError, match="explicit operator confirmation"):
+        codex_handoff.reconcile_stale_run()
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == (
+        "RECOVERY_CONFIRMATION_REQUIRED"
+    )
+    events: list[str] = []
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "load_recovery_issue", lambda _context: issue)
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "comment_once", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+
+    def finalize(
+        _issue: object,
+        _context: object,
+        _log: Path,
+        *,
+        allow_merge: bool,
+        recovering: bool,
+    ) -> None:
+        assert allow_merge is False
+        assert recovering is True
+        codex_handoff.validate_recovery_scope()
+        events.append("finalized")
+
+    monkeypatch.setattr(codex_handoff, "finalize_changes", finalize)
+    assert codex_handoff.confirm_recovery() == 0
+
+    assert events == ["finalized"]
+
+
+def test_legacy_recovery_without_manifest_requires_operator_confirmation(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    status_file.write_text(
+        json.dumps({"state": "RECOVERABLE_CHANGES", **context}), encoding="utf-8"
+    )
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(
+        codex_handoff,
+        "load_recovery_issue",
+        lambda received: (
+            {"number": 110, "title": "Recover stalled child", "body": "Contract"}
+            if received == context
+            else None
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: ["docs/DEV-HANDOFF.md"])
+    monkeypatch.setattr(
+        codex_handoff, "recovery_snapshot", lambda _paths: "confirmed-legacy-snapshot"
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "captured_recovery_scope",
+        lambda: (["docs/DEV-HANDOFF.md"], "confirmed-legacy-snapshot"),
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=(
+                f"{context['branch']}\n"
+                if args == ("git", "branch", "--show-current")
+                else " M docs/DEV-HANDOFF.md\n"
+                if args == ("git", "status", "--porcelain")
+                else ""
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "comment_once", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    events: list[str] = []
+
+    def finalize(
+        _issue: object,
+        _context: object,
+        _log: Path,
+        *,
+        allow_merge: bool,
+        recovering: bool,
+    ) -> None:
+        assert allow_merge is False
+        assert recovering is True
+        codex_handoff.validate_recovery_scope()
+        events.append("finalized")
+
+    monkeypatch.setattr(codex_handoff, "finalize_changes", finalize)
+
+    with pytest.raises(RuntimeError, match="explicit operator confirmation"):
+        codex_handoff.reconcile_stale_run()
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == (
+        "RECOVERY_CONFIRMATION_REQUIRED"
+    )
+    assert codex_handoff.confirm_recovery() == 0
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["recoverable_paths"] == ["docs/DEV-HANDOFF.md"]
+    assert events == ["finalized"]
+
+
+def test_starting_new_task_clears_previous_finalization_metadata(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "MERGE_BLOCKED",
+                "pr_url": "https://github.com/example/repo/pull/1",
+                "recoverable_paths": ["old.py"],
+                "finalization_checkpoint": "PR_CREATED",
+                "commit_sha": "old-sha",
+                "pre_commit_sha": "old-base-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "prepare_task_branch", lambda _branch: None)
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "run_codex_stream", lambda *_args, **_kwargs: (7, "failed"))
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(args, 0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="Codex exited with 7"):
+        codex_handoff.process_issue({"number": 111, "title": "Next task"})
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["issue"] == 111
+    assert status["pr_url"] is None
+    assert status["recoverable_paths"] is None
+    assert status["finalization_checkpoint"] is None
+    assert status["commit_sha"] is None
+    assert status["pre_commit_sha"] is None
+
+
+def test_dead_implementing_pid_without_changes_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "codex_pid": 999999,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = (
+            "codex/issue-110-recover-stalled-child\n"
+            if args == ("git", "branch", "--show-current")
+            else ""
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    issue = {"number": 110, "title": "Recover stalled child"}
+    events: list[str] = []
+    monkeypatch.setattr(codex_handoff, "load_recovery_issue", lambda _context: issue)
+    monkeypatch.setattr(
+        codex_handoff,
+        "label",
+        lambda number, *, add, remove=None: events.append(f"label:{number}:{add}:{remove}"),
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "comment",
+        lambda number, body: events.append(f"comment:{number}:{body}"),
+    )
+
+    with pytest.raises(RuntimeError, match="no working-tree changes"):
+        codex_handoff.reconcile_stale_run()
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "FAILED"
+    assert f"label:110:{codex_handoff.FAILED_LABEL}:{codex_handoff.RUNNING_LABEL}" in events
+    assert any(event.startswith("comment:110:Local Codex controller failed:") for event in events)
+
+
+def test_dead_child_with_unavailable_issue_leaves_recovery_blocked(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "codex_pid": 999999,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = (
+            "codex/issue-110-recover-stalled-child\n"
+            if args == ("git", "branch", "--show-current")
+            else ""
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    monkeypatch.setattr(
+        codex_handoff,
+        "load_recovery_issue",
+        lambda _context: (_ for _ in ()).throw(RuntimeError("issue unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="issue unavailable"):
+        codex_handoff.reconcile_stale_run()
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "RECOVERY_BLOCKED"
+
+
+def test_status_write_failure_preserves_previous_complete_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    original = '{"state": "IMPLEMENTING", "issue": 110}\n'
+    status_file.write_text(original, encoding="utf-8")
+    replacement_sources: list[Path] = []
+
+    def fail_replace(source: Path, _destination: Path) -> None:
+        replacement_sources.append(Path(source))
+        raise OSError("simulated replacement failure")
+
+    monkeypatch.setattr(codex_handoff.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replacement failure"):
+        codex_handoff.write_status("FIXING", issue=110)
+
+    assert status_file.read_text(encoding="utf-8") == original
+    assert len(replacement_sources) == 1
+    assert replacement_sources[0].parent == status_file.parent
+    assert not replacement_sources[0].exists()
+
+
+def test_recovery_fails_closed_when_branch_identity_does_not_match(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="codex/different-task\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="branch identity"):
+        codex_handoff.reconcile_stale_run()
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "RECOVERY_BLOCKED"
+
+
+def test_recovery_rejects_dirty_files_outside_child_captured_scope(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "recoverable_paths": ["devtools/codex_handoff.py"],
+                "recoverable_snapshot": "captured",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "working_tree_paths",
+        lambda: ["devtools/codex_handoff.py", "operator-notes.txt"],
+    )
+
+    with pytest.raises(RuntimeError, match="working-tree scope"):
+        codex_handoff.validate_recovery_scope()
+
+
+def test_recovery_rejects_same_path_content_mutation(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    paths = ["devtools/codex_handoff.py"]
+    status_file.write_text(
+        json.dumps({"recoverable_paths": paths, "recoverable_snapshot": "captured"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: paths)
+    monkeypatch.setattr(codex_handoff, "recovery_snapshot", lambda _paths: "mutated")
+
+    with pytest.raises(RuntimeError, match="working-tree scope"):
+        codex_handoff.validate_recovery_scope()
+
+
+def test_recovery_snapshot_changes_when_head_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    head = "base-sha"
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout=f"{head}\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    before = codex_handoff.recovery_snapshot(["missing.py"])
+    head = "substituted-sha"
+
+    assert codex_handoff.recovery_snapshot(["missing.py"]) != before
+
+
+def test_recovery_accepts_proven_post_staging_index_transition(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    paths = ["devtools/codex_handoff.py"]
+    status_file.write_text(
+        json.dumps(
+            {
+                "recoverable_paths": paths,
+                "recoverable_snapshot": "pre-staging-index",
+                "recoverable_content_snapshot": "unchanged-content",
+                "finalization_checkpoint": "STAGING",
+                "recoverable_base_sha": "base-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: paths)
+    monkeypatch.setattr(codex_handoff, "recovery_snapshot", lambda _paths: "staged-index")
+    monkeypatch.setattr(
+        codex_handoff, "recovery_content_snapshot", lambda _paths: "unchanged-content"
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="base-sha\n" if args == ("git", "rev-parse", "HEAD") else ""
+        ),
+    )
+
+    codex_handoff.validate_recovery_scope()
+
+
+def test_interruption_after_staging_preserves_a_valid_recovery_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _lock_file, status_file = runtime_paths
+    paths = ["changed.py"]
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    codex_handoff.write_status(
+        "IMPLEMENTING",
+        recoverable_paths=paths,
+        recoverable_snapshot="pre-staging-index",
+        **context,
+    )
+    monkeypatch.setattr(codex_handoff, "run_verification", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: paths)
+    monkeypatch.setattr(
+        codex_handoff, "recovery_content_snapshot", lambda _paths: "unchanged-content"
+    )
+
+    def interrupt_before_commit(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="base-sha\n", stderr="")
+        if args == ("git", "write-tree"):
+            return subprocess.CompletedProcess(args, 0, stdout="tree-sha\n", stderr="")
+        if args[:2] == ("git", "commit"):
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", interrupt_before_commit)
+
+    with pytest.raises(KeyboardInterrupt):
+        codex_handoff.finalize_changes(
+            {"number": 110, "title": "Recover stalled child", "body": "Contract"},
+            context,
+            tmp_path / "handoff.log",
+            allow_merge=False,
+        )
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "COMMITTING"
+    assert status["finalization_checkpoint"] == "STAGED"
+    assert status["recoverable_content_snapshot"] == "unchanged-content"
+    monkeypatch.setattr(codex_handoff, "recovery_snapshot", lambda _paths: "staged-index")
+    codex_handoff.validate_recovery_scope()
+
+
+def test_review_fix_interruption_after_staging_preserves_recovery_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    paths = ["changed.py"]
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    codex_handoff.write_status(
+        "PR_CREATED",
+        pr_url="https://github.com/example/repo/pull/1",
+        finalization_checkpoint="PR_CREATED",
+        commit_sha="initial-sha",
+        **context,
+    )
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: paths)
+    monkeypatch.setattr(
+        codex_handoff, "recovery_content_snapshot", lambda _paths: "unchanged-content"
+    )
+
+    def interrupt_before_commit(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="initial-sha\n", stderr="")
+        if args == ("git", "write-tree"):
+            return subprocess.CompletedProcess(args, 0, stdout="tree-sha\n", stderr="")
+        if args[:2] == ("git", "commit"):
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", interrupt_before_commit)
+
+    with pytest.raises(KeyboardInterrupt):
+        codex_handoff.commit_review_fix(
+            {"number": 110, "title": "Recover stalled child"}, 1, context
+        )
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["finalization_checkpoint"] == "STAGED"
+    assert status["pending_commit_subject"] == "codex: address review round 1 for #110"
+    monkeypatch.setattr(codex_handoff, "recovery_snapshot", lambda _paths: "staged-index")
+    codex_handoff.validate_recovery_scope()
+
+
+def test_recovery_proves_review_fix_commit_created_before_checkpoint_write(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    paths = ["changed.py"]
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    committed = False
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: [] if committed else paths)
+    monkeypatch.setattr(
+        codex_handoff, "recovery_content_snapshot", lambda _paths: "unchanged-content"
+    )
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal committed
+        outputs = {
+            ("git", "branch", "--show-current"): f"{context['branch']}\n",
+            ("git", "status", "--porcelain"): "",
+            ("git", "rev-parse", "HEAD^"): "initial-sha\n",
+            ("git", "rev-parse", "HEAD^{tree}"): "tree-sha\n",
+            ("git", "log", "-1", "--pretty=%s"): "codex: address review round 1 for #110\n",
+            ("git", "write-tree"): "tree-sha\n",
+        }
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(
+                args, 0, stdout="fix-sha\n" if committed else "initial-sha\n", stderr=""
+            )
+        if args[:2] == ("git", "commit"):
+            committed = True
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    original_write_status = codex_handoff.write_status
+
+    def interrupt_checkpoint(state: str, **kwargs: object) -> None:
+        if state == "COMMITTED":
+            raise KeyboardInterrupt
+        original_write_status(state, **kwargs)
+
+    monkeypatch.setattr(codex_handoff, "write_status", interrupt_checkpoint)
+
+    with pytest.raises(KeyboardInterrupt):
+        codex_handoff.commit_review_fix(
+            {"number": 110, "title": "Recover stalled child"}, 1, context
+        )
+
+    monkeypatch.setattr(codex_handoff, "write_status", original_write_status)
+    assert codex_handoff.reconcile_stale_run() == context
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["finalization_checkpoint"] == "COMMITTED"
+    assert status["commit_sha"] == "fix-sha"
+
+
+def test_recovery_rejects_post_staging_content_mutation(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    paths = ["devtools/codex_handoff.py"]
+    status_file.write_text(
+        json.dumps(
+            {
+                "recoverable_paths": paths,
+                "recoverable_snapshot": "pre-staging-index",
+                "recoverable_content_snapshot": "captured-content",
+                "finalization_checkpoint": "STAGING",
+                "recoverable_base_sha": "base-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: paths)
+    monkeypatch.setattr(codex_handoff, "recovery_snapshot", lambda _paths: "staged-index")
+    monkeypatch.setattr(
+        codex_handoff, "recovery_content_snapshot", lambda _paths: "mutated-content"
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="base-sha\n" if args == ("git", "rev-parse", "HEAD") else ""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="working-tree scope"):
+        codex_handoff.validate_recovery_scope()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_absent"),
+    [
+        ("COMMITTED", "git commit"),
+        ("PUSHED", "git push"),
+        ("PR_CREATED", "gh pr create"),
+    ],
+)
+def test_recovery_resumes_from_finalization_checkpoint(
+    checkpoint: str,
+    expected_absent: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _lock_file, status_file = runtime_paths
+    pr_url = "https://github.com/example/repo/pull/1"
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "finalization_checkpoint": checkpoint,
+                "commit_sha": "task-sha",
+                "pr_url": pr_url if checkpoint == "PR_CREATED" else None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    events: list[str] = []
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        events.append(" ".join(args))
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="task-sha\n", stderr="")
+        if args[:3] == ("gh", "pr", "create"):
+            return subprocess.CompletedProcess(args, 0, stdout=f"{pr_url}\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+    monkeypatch.setattr(codex_handoff, "run_verification", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "validate_recovery_scope", lambda: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "remote_branch_head",
+        lambda _branch: "task-sha" if checkpoint in {"PUSHED", "PR_CREATED"} else None,
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "_pr_metadata",
+        lambda _url: {
+            "url": pr_url,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "codex/issue-110-recover-stalled-child",
+            "headRefOid": "task-sha",
+        },
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "find_draft_pr",
+        lambda _branch: pr_url if checkpoint in {"PUSHED", "PR_CREATED"} else None,
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_review_fix_loop",
+        lambda *_args: review_result(verdict="pass", findings=[]),
+    )
+    monkeypatch.setattr(codex_handoff, "mark_pr_review_passed", lambda *_args: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "merge_reviewed_pr",
+        lambda *_args: {"merged": False, "reasons": ["recovery"], "sha": None},
+    )
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "comment_once", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+
+    codex_handoff.finalize_changes(
+        {"number": 110, "title": "Recover stalled child", "body": "Contract"},
+        {
+            "issue": 110,
+            "title": "Recover stalled child",
+            "branch": "codex/issue-110-recover-stalled-child",
+            "started_at": "now",
+        },
+        tmp_path / "recovery.log",
+        allow_merge=False,
+        recovering=True,
+    )
+
+    assert all(expected_absent not in event for event in events)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "local_head", "remote_head", "message"),
+    [
+        ("COMMITTED", "substituted-sha", None, "current HEAD"),
+        ("PUSHED", "task-sha", "substituted-sha", "remote branch head"),
+    ],
+)
+def test_recovery_rejects_revision_mismatch_before_verification(
+    checkpoint: str,
+    local_head: str,
+    remote_head: str | None,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "finalization_checkpoint": checkpoint,
+                "commit_sha": "task-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    verification_called = False
+
+    def verify(*_args: object) -> None:
+        nonlocal verification_called
+        verification_called = True
+
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: [])
+    monkeypatch.setattr(codex_handoff, "run_verification", verify)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=f"{local_head}\n" if args == ("git", "rev-parse", "HEAD") else ""
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "remote_branch_head", lambda _branch: remote_head)
+
+    with pytest.raises(RuntimeError, match=message):
+        codex_handoff.finalize_changes(
+            {"number": 110, "title": "Recover stalled child", "body": "Contract"},
+            {
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "now",
+            },
+            tmp_path / "recovery.log",
+            allow_merge=False,
+            recovering=True,
+        )
+
+    assert verification_called is False
+
+
+def test_recovery_rejects_pr_head_mismatch_before_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _lock_file, status_file = runtime_paths
+    pr_url = "https://github.com/example/repo/pull/1"
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "finalization_checkpoint": "PR_CREATED",
+                "commit_sha": "task-sha",
+                "pr_url": pr_url,
+            }
+        ),
+        encoding="utf-8",
+    )
+    verification_called = False
+
+    def verify(*_args: object) -> None:
+        nonlocal verification_called
+        verification_called = True
+
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: [])
+    monkeypatch.setattr(codex_handoff, "run_verification", verify)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="task-sha\n" if args == ("git", "rev-parse", "HEAD") else ""
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "remote_branch_head", lambda _branch: "task-sha")
+    monkeypatch.setattr(
+        codex_handoff,
+        "_pr_metadata",
+        lambda _url: {
+            "url": pr_url,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": "codex/issue-110-recover-stalled-child",
+            "headRefOid": "substituted-sha",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="recorded revision"):
+        codex_handoff.finalize_changes(
+            {"number": 110, "title": "Recover stalled child", "body": "Contract"},
+            {
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "now",
+            },
+            tmp_path / "recovery.log",
+            allow_merge=False,
+            recovering=True,
+        )
+
+    assert verification_called is False
+
+
+def test_committed_recovery_stops_when_successful_verification_dirties_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "finalization_checkpoint": "COMMITTED",
+                "commit_sha": "task-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    verification_mutated = False
+    pushed = False
+    monkeypatch.setattr(
+        codex_handoff,
+        "working_tree_paths",
+        lambda: ["generated.py"] if verification_mutated else [],
+    )
+
+    def verify(*_args: object) -> None:
+        nonlocal verification_mutated
+        verification_mutated = True
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal pushed
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="task-sha\n", stderr="")
+        if args[:2] == ("git", "push"):
+            pushed = True
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run_verification", verify)
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="dirtied a committed checkpoint"):
+        codex_handoff.finalize_changes(
+            {"number": 110, "title": "Recover stalled child", "body": "Contract"},
+            {
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "now",
+            },
+            tmp_path / "recovery.log",
+            allow_merge=False,
+            recovering=True,
+        )
+
+    assert pushed is False
+
+
+def test_recovery_proves_commit_created_before_checkpoint_write(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "COMMITTING",
+                "pre_commit_sha": "base-sha",
+                "pending_commit_subject": "codex: resolve issue #110",
+                "pending_tree_sha": "tree-sha",
+                "finalization_checkpoint": "STAGED",
+                **context,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs = {
+            ("git", "branch", "--show-current"): f"{context['branch']}\n",
+            ("git", "status", "--porcelain"): "",
+            ("git", "rev-parse", "HEAD"): "task-sha\n",
+            ("git", "rev-parse", "HEAD^"): "base-sha\n",
+            ("git", "rev-parse", "HEAD^{tree}"): "tree-sha\n",
+            ("git", "log", "-1", "--pretty=%s"): "codex: resolve issue #110\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    assert codex_handoff.reconcile_stale_run() == context
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["finalization_checkpoint"] == "COMMITTED"
+    assert status["commit_sha"] == "task-sha"
+
+
+def test_recovery_rejects_unproven_commit_created_before_checkpoint_write(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "COMMITTING",
+                "pre_commit_sha": "base-sha",
+                "pending_commit_subject": "codex: resolve issue #110",
+                "pending_tree_sha": "expected-tree-sha",
+                "finalization_checkpoint": "STAGED",
+                **context,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs = {
+            ("git", "branch", "--show-current"): f"{context['branch']}\n",
+            ("git", "status", "--porcelain"): "",
+            ("git", "rev-parse", "HEAD"): "unrelated-sha\n",
+            ("git", "rev-parse", "HEAD^"): "base-sha\n",
+            ("git", "rev-parse", "HEAD^{tree}"): "different-tree-sha\n",
+            ("git", "log", "-1", "--pretty=%s"): "codex: resolve issue #110\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="Cannot prove the commit"):
+        codex_handoff.reconcile_stale_run()
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "COMMITTING"
+    assert status.get("finalization_checkpoint") == "STAGED"
+
+
+def test_no_output_child_is_terminated_after_bounded_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    command = (
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+    )
+
+    return_code, output = codex_handoff.run_codex_stream(
+        "",
+        tmp_path / "hung.log",
+        {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+        command=command,
+        inactivity_timeout=0.05,
+        termination_grace=0.1,
+    )
+
+    assert return_code != 0
+    assert "inactivity timeout" in output
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "IMPLEMENTING"
+    assert status["codex_pid"] is None
+
+
+def test_child_cannot_execute_before_launch_identity_is_durable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    side_effect = tmp_path / "child-executed"
+    original_write_status = codex_handoff.write_status
+    rejected_identity_checkpoint = False
+
+    def fail_first_identity_checkpoint(state: str, **kwargs: object) -> None:
+        nonlocal rejected_identity_checkpoint
+        if state == "IMPLEMENTING" and not rejected_identity_checkpoint:
+            rejected_identity_checkpoint = True
+            raise RuntimeError("simulated crash before durable child identity")
+        original_write_status(state, **kwargs)
+
+    monkeypatch.setattr(codex_handoff, "write_status", fail_first_identity_checkpoint)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        codex_handoff.run_codex_stream(
+            "",
+            tmp_path / "launch-gate.log",
+            {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+            command=(
+                sys.executable,
+                "-c",
+                "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+                str(side_effect),
+            ),
+            inactivity_timeout=1,
+            termination_grace=0.2,
+        )
+
+    assert rejected_identity_checkpoint is True
+    assert not side_effect.exists()
+
+
+def test_process_group_identity_survives_launch_gate_exec(tmp_path: Path) -> None:
+    ready_file = tmp_path / "exec-ready"
+    gate_read, gate_write = os.pipe()
+    process = subprocess.Popen(
+        (
+            sys.executable,
+            "-c",
+            codex_handoff.LAUNCH_GATE_SCRIPT,
+            str(gate_read),
+            sys.executable,
+            "-c",
+            "import pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text('ready'); "
+            "time.sleep(30)",
+            str(ready_file),
+        ),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+        pass_fds=(gate_read,),
+    )
+    os.close(gate_read)
+    try:
+        identity_before = codex_handoff.process_group_identity(process.pid)
+        assert identity_before is not None
+        os.write(gate_write, b"1")
+        os.close(gate_write)
+        deadline = time.monotonic() + 2
+        while not ready_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready_file.exists()
+
+        assert codex_handoff.process_group_identity(process.pid) == identity_before
+    finally:
+        try:
+            os.close(gate_write)
+        except OSError:
+            pass
+        if process.poll() is None:
+            codex_handoff.terminate_process_group(process, 0.2)
+
+
+def test_large_prompt_to_non_reading_child_respects_inactivity_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    command = (sys.executable, "-c", "import time; time.sleep(30)")
+
+    started = time.monotonic()
+    return_code, output = codex_handoff.run_codex_stream(
+        "x" * 2_000_000,
+        tmp_path / "blocked-stdin.log",
+        {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+        command=command,
+        inactivity_timeout=0.05,
+        termination_grace=0.1,
+    )
+
+    assert return_code != 0
+    assert "inactivity timeout" in output
+    assert time.monotonic() - started < 2
+
+
+def test_slow_prompt_consumption_does_not_reset_output_inactivity_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    script = (
+        "import sys, time; [(sys.stdin.buffer.read(1), time.sleep(0.01)) for _ in range(100000)]"
+    )
+
+    started = time.monotonic()
+    return_code, output = codex_handoff.run_codex_stream(
+        "x" * 100_000,
+        tmp_path / "slow-stdin.log",
+        {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+        command=(sys.executable, "-c", script),
+        inactivity_timeout=0.05,
+        termination_grace=0.1,
+    )
+
+    assert return_code != 0
+    assert "inactivity timeout" in output
+    assert time.monotonic() - started < 2
+
+
+def test_slow_recovery_snapshot_does_not_block_output_drain_or_trigger_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    snapshot_calls = 0
+
+    def slow_snapshot() -> tuple[list[str] | None, str | None]:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        time.sleep(0.08)
+        return None, None
+
+    monkeypatch.setattr(codex_handoff, "captured_recovery_scope", slow_snapshot)
+    script = "import os; [os.write(1, b'x' * 4096) for _ in range(64)]"
+
+    return_code, output = codex_handoff.run_codex_stream(
+        "",
+        tmp_path / "slow-snapshot.log",
+        {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+        command=(sys.executable, "-c", script),
+        inactivity_timeout=0.05,
+        termination_grace=0.1,
+    )
+
+    assert return_code == 0
+    assert len(output) == 64 * 4096
+    assert snapshot_calls == 2
+
+
+def test_timeout_terminates_descendant_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    descendant_pid_file = tmp_path / "descendant.pid"
+    snapshot_proved_group_exit = False
+    real_capture = codex_handoff.captured_recovery_scope
+
+    def capture_after_group_exit() -> tuple[list[str] | None, str | None]:
+        nonlocal snapshot_proved_group_exit
+        if descendant_pid_file.exists():
+            descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+            with pytest.raises(ProcessLookupError):
+                os.kill(descendant_pid, 0)
+            snapshot_proved_group_exit = True
+        return real_capture()
+
+    monkeypatch.setattr(codex_handoff, "captured_recovery_scope", capture_after_group_exit)
+    script = (
+        "import pathlib, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "print('ready', flush=True); time.sleep(30)"
+    )
+
+    return_code, output = codex_handoff.run_codex_stream(
+        "",
+        tmp_path / "descendant.log",
+        {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+        command=(sys.executable, "-c", script, str(descendant_pid_file)),
+        inactivity_timeout=0.1,
+        termination_grace=0.1,
+    )
+
+    assert return_code != 0
+    assert "inactivity timeout" in output
+    descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant_pid, 0)
+    assert snapshot_proved_group_exit is True
+
+
+def test_normal_child_exit_terminates_leftover_descendant_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    descendant_pid_file = tmp_path / "normal-descendant.pid"
+    script = (
+        "import pathlib, subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))"
+    )
+
+    return_code, _output = codex_handoff.run_codex_stream(
+        "",
+        tmp_path / "normal-descendant.log",
+        {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+        command=(sys.executable, "-c", script, str(descendant_pid_file)),
+        inactivity_timeout=1,
+        termination_grace=0.1,
+    )
+
+    assert return_code == 0
+    descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant_pid, 0)
+
+
+def test_keyboard_interrupt_terminates_descendant_process_group_and_clears_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    descendant_pid_file = tmp_path / "interrupt-descendant.pid"
+    script = (
+        "import pathlib, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    real_select = codex_handoff.select.select
+
+    def interrupt_after_descendant(
+        readers: list[object], writers: list[object], errors: list[object], timeout: float
+    ) -> tuple[list[object], list[object], list[object]]:
+        if descendant_pid_file.exists():
+            raise KeyboardInterrupt
+        return real_select(readers, writers, errors, timeout)
+
+    monkeypatch.setattr(codex_handoff.select, "select", interrupt_after_descendant)
+
+    with pytest.raises(KeyboardInterrupt):
+        codex_handoff.run_codex_stream(
+            "",
+            tmp_path / "interrupt-descendant.log",
+            {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+            command=(sys.executable, "-c", script, str(descendant_pid_file)),
+            inactivity_timeout=2,
+            termination_grace=0.1,
+        )
+
+    descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant_pid, 0)
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["codex_pid"] is None
+    assert "interrupted" in status["detail"]
+
+
+def test_recovery_verifies_and_finalizes_without_rerunning_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    issue = {"number": 110, "title": "Recover stalled child", "body": "Contract"}
+    events: list[str] = []
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "recoverable_paths": ["changed.py"],
+                **context,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(
+        codex_handoff,
+        "load_recovery_issue",
+        lambda received: issue if received == context else None,
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "finalize_changes",
+        lambda received_issue, received_context, _log, *, allow_merge, recovering: events.append(
+            f"finalize:{received_issue['number']}:{received_context['branch']}:{allow_merge}:"
+            f"{recovering}"
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: events.append("comment"))
+
+    codex_handoff.recover_changes(context)
+
+    assert events == [
+        "comment",
+        "finalize:110:codex/issue-110-recover-stalled-child:False:True",
+    ]
+
+
+def test_failed_child_with_changes_is_recoverable_not_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    monkeypatch.setattr(codex_handoff, "prepare_task_branch", lambda _branch: None)
+    monkeypatch.setattr(
+        codex_handoff, "run_codex_stream", lambda *_args, **_kwargs: (9, "timed out")
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=(
+                " M docs/DEV-HANDOFF.md\n"
+                if args == ("git", "status", "--porcelain")
+                else "base-sha\n"
+                if args == ("git", "rev-parse", "HEAD")
+                else ""
+            ),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: ["docs/DEV-HANDOFF.md"])
+
+    with pytest.raises(codex_handoff.RecoverableChangesError):
+        codex_handoff.process_issue({"number": 110, "title": "Recover stalled child"})
+
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert "preserved changes" in status["detail"]
+
+
+def test_interrupted_child_with_changes_is_recoverable_not_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    monkeypatch.setattr(codex_handoff, "prepare_task_branch", lambda _branch: None)
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(
+        codex_handoff,
+        "run_codex_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "captured_recovery_scope",
+        lambda: (["docs/DEV-HANDOFF.md"], "snapshot"),
+    )
+
+    with pytest.raises(codex_handoff.RecoverableChangesError, match="preserved task changes"):
+        codex_handoff.process_issue({"number": 110, "title": "Recover stalled child"})
+
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["recoverable_paths"] == ["docs/DEV-HANDOFF.md"]
+    assert status["recoverable_snapshot"] == "snapshot"
+
+
+def test_failed_fixer_with_changes_is_recoverable_and_clears_old_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "PR_CREATED",
+                "pr_url": "https://github.com/example/repo/pull/1",
+                "finalization_checkpoint": "PR_CREATED",
+                "commit_sha": "old-sha",
+                "pre_commit_sha": "old-base-sha",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+
+    def fail_fixer(*_args: object, **kwargs: object) -> tuple[int, str]:
+        codex_handoff.write_status(
+            kwargs["state"],
+            reset_recovery=True,
+            recoverable_paths=["devtools/codex_handoff.py"],
+            issue=16,
+            title="Task",
+            branch="codex/task",
+            started_at="now",
+        )
+        return 9, "timed out"
+
+    monkeypatch.setattr(codex_handoff, "run_codex_stream", fail_fixer)
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: ["devtools/codex_handoff.py"])
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=(
+                " M devtools/codex_handoff.py\n"
+                if args == ("git", "status", "--porcelain")
+                else "base-sha\n"
+                if args == ("git", "rev-parse", "HEAD")
+                else ""
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(codex_handoff.RecoverableChangesError):
+        codex_handoff.run_fixer(
+            {"number": 16, "title": "Task", "body": "Contract"},
+            [finding()],
+            {"issue": 16, "title": "Task", "branch": "codex/task", "started_at": "now"},
+            1,
+        )
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["recoverable_paths"] == ["devtools/codex_handoff.py"]
+    assert status["finalization_checkpoint"] is None
+    assert status["commit_sha"] is None
+    assert status["pre_commit_sha"] is None
+
+
+def test_dead_legacy_fixing_pid_with_changes_requires_confirmation(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "FIXING",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "codex_pid": 999999,
+                "recoverable_paths": ["devtools/codex_handoff.py"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs = {
+            ("git", "branch", "--show-current"): "codex/issue-110-recover-stalled-child\n",
+            ("git", "status", "--porcelain"): " M devtools/codex_handoff.py\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="explicit operator confirmation"):
+        codex_handoff.reconcile_stale_run()
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == (
+        "RECOVERY_CONFIRMATION_REQUIRED"
+    )
+
+
+@pytest.mark.parametrize("state", ["VERIFYING", "REVIEWING", "REVIEW_PASSED"])
+def test_stale_finalization_state_is_reconciled_before_selecting_another_issue(
+    state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    reviewing = state in {"REVIEWING", "REVIEW_PASSED"}
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": state,
+                "recoverable_paths": None if reviewing else ["devtools/codex_handoff.py"],
+                "recoverable_snapshot": None if reviewing else "captured-snapshot",
+                "finalization_checkpoint": "PR_CREATED" if reviewing else None,
+                "commit_sha": "task-sha" if reviewing else None,
+                "pr_url": "https://github.com/example/repo/pull/1" if reviewing else None,
+                **context,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs = {
+            ("git", "branch", "--show-current"): f"{context['branch']}\n",
+            ("git", "status", "--porcelain"): (
+                "" if reviewing else " M devtools/codex_handoff.py\n"
+            ),
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    assert codex_handoff.reconcile_stale_run() == context
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["finalization_checkpoint"] == ("PR_CREATED" if reviewing else None)
+
+
+def test_failed_recovery_releases_controller_lock(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, _status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    monkeypatch.setattr(codex_handoff, "reconcile_stale_run", lambda: context)
+    monkeypatch.setattr(
+        codex_handoff,
+        "recover_changes",
+        lambda _context: (_ for _ in ()).throw(
+            codex_handoff.RecoverableChangesError("verification failed")
+        ),
+    )
+
+    with pytest.raises(codex_handoff.RecoverableChangesError, match="verification failed"):
+        codex_handoff.run_once()
+
+    assert not lock_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("state", "checkpoint", "paths"),
+    [
+        ("VERIFYING", None, ["devtools/codex_handoff.py"]),
+        ("COMMITTED", "COMMITTED", []),
+        ("PUSHED", "PUSHED", []),
+        ("REVIEWING", "PR_CREATED", []),
+        ("REVIEW_PASSED", "PR_CREATED", []),
+    ],
+)
+def test_run_once_preserves_resumable_finalization_failure(
+    state: str,
+    checkpoint: str | None,
+    paths: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+) -> None:
+    lock_file, status_file = runtime_paths
+    issue = {"number": 110, "title": "Recover stalled child"}
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    monkeypatch.setattr(codex_handoff, "reconcile_stale_run", lambda: None)
+    monkeypatch.setattr(codex_handoff, "clean_tree_required", lambda: None)
+    monkeypatch.setattr(codex_handoff, "next_issue", lambda: issue)
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: paths)
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+
+    def fail_finalization(_issue: object) -> None:
+        codex_handoff.write_status(
+            state,
+            finalization_checkpoint=checkpoint,
+            commit_sha="task-sha" if checkpoint else None,
+            recoverable_paths=paths or None,
+            recoverable_snapshot="trusted-snapshot" if paths else None,
+            **context,
+        )
+        raise RuntimeError("transient finalization failure")
+
+    monkeypatch.setattr(codex_handoff, "process_issue", fail_finalization)
+
+    with pytest.raises(codex_handoff.RecoverableChangesError, match="requires recovery"):
+        codex_handoff.run_once()
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["finalization_checkpoint"] == checkpoint
+    assert not lock_file.exists()
+
+
+def test_verification_failure_does_not_bless_mutated_recovery_scope(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    issue = {"number": 110, "title": "Recover stalled child"}
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    codex_handoff.write_status(
+        "VERIFYING",
+        recoverable_paths=["changed.py"],
+        recoverable_snapshot="trusted-snapshot",
+        **context,
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "captured_recovery_scope",
+        lambda: (_ for _ in ()).throw(AssertionError("must not recapture after verification")),
+    )
+
+    error = codex_handoff.recoverable_finalization_error(
+        issue, RuntimeError("verification created generated.py then failed")
+    )
+
+    assert isinstance(error, codex_handoff.RecoverableChangesError)
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["recoverable_paths"] == ["changed.py"]
+    assert status["recoverable_snapshot"] == "trusted-snapshot"
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: ["changed.py", "generated.py"])
+    with pytest.raises(RuntimeError, match="working-tree scope"):
+        codex_handoff.validate_recovery_scope()
+
+
+def test_successful_recovery_verification_cannot_expand_committed_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_paths: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    _lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    codex_handoff.write_status(
+        "RECOVERABLE_CHANGES",
+        recoverable_paths=["changed.py"],
+        recoverable_snapshot="trusted-snapshot",
+        **context,
+    )
+    verification_mutated = False
+    commit_called = False
+    monkeypatch.setattr(
+        codex_handoff,
+        "working_tree_paths",
+        lambda: ["changed.py", "generated.py"] if verification_mutated else ["changed.py"],
+    )
+    monkeypatch.setattr(codex_handoff, "recovery_snapshot", lambda _paths: "trusted-snapshot")
+
+    def verify(*_args: object) -> None:
+        nonlocal verification_mutated
+        verification_mutated = True
+
+    def commit(*_args: object, **_kwargs: object) -> str:
+        nonlocal commit_called
+        commit_called = True
+        return "task-sha"
+
+    monkeypatch.setattr(codex_handoff, "run_verification", verify)
+    monkeypatch.setattr(codex_handoff, "commit_with_recovery_checkpoint", commit)
+
+    with pytest.raises(RuntimeError, match="working-tree scope"):
+        codex_handoff.finalize_changes(
+            {"number": 110, "title": "Recover stalled child", "body": "Contract"},
+            context,
+            tmp_path / "recovery.log",
+            allow_merge=False,
+            recovering=True,
+        )
+
+    assert commit_called is False
+
+
+def test_watch_preserves_resumable_finalization_failure(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, status_file = runtime_paths
+    issue = {"number": 110, "title": "Recover stalled child"}
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    monkeypatch.setattr(codex_handoff, "reconcile_stale_run", lambda: None)
+    monkeypatch.setattr(codex_handoff, "clean_tree_required", lambda: None)
+    monkeypatch.setattr(codex_handoff, "next_issue", lambda: issue)
+    monkeypatch.setattr(codex_handoff, "working_tree_paths", lambda: [])
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+
+    def fail_after_push(_issue: object) -> None:
+        codex_handoff.write_status(
+            "PUSHED",
+            finalization_checkpoint="PUSHED",
+            commit_sha="task-sha",
+            **context,
+        )
+        raise RuntimeError("draft PR creation failed")
+
+    monkeypatch.setattr(codex_handoff, "process_issue", fail_after_push)
+
+    with pytest.raises(codex_handoff.RecoverableChangesError, match="requires recovery"):
+        codex_handoff.run_watch(30)
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["finalization_checkpoint"] == "PUSHED"
+    assert not lock_file.exists()
+
+
+def test_watch_supervises_fresh_live_orphan_until_recovery_is_ready(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, _status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    reconcile_calls = 0
+    sleeps: list[int] = []
+    recovered: list[dict[str, object]] = []
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+
+    def reconcile() -> dict[str, object] | None:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls == 1:
+            raise codex_handoff.ActiveOrphanError("orphan is within inactivity window")
+        if reconcile_calls == 2:
+            return context
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(codex_handoff, "reconcile_stale_run", reconcile)
+    monkeypatch.setattr(codex_handoff.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(codex_handoff, "recover_changes", lambda item: recovered.append(item))
+
+    assert codex_handoff.run_watch(30) == 0
+    assert sleeps == [30]
+    assert recovered == [context]
+    assert not lock_file.exists()
+
+
+def test_watch_interrupt_during_verification_preserves_recoverable_state(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, status_file = runtime_paths
+    issue = {"number": 110, "title": "Recover stalled child"}
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    monkeypatch.setattr(codex_handoff, "reconcile_stale_run", lambda: None)
+    monkeypatch.setattr(codex_handoff, "clean_tree_required", lambda: None)
+    monkeypatch.setattr(codex_handoff, "next_issue", lambda: issue)
+
+    def interrupt_verification(_issue: object) -> None:
+        codex_handoff.write_status(
+            "VERIFYING",
+            recoverable_paths=["changed.py"],
+            recoverable_snapshot="trusted-snapshot",
+            **context,
+        )
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(codex_handoff, "process_issue", interrupt_verification)
+
+    with pytest.raises(codex_handoff.RecoverableChangesError):
+        codex_handoff.run_watch(30)
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["recoverable_snapshot"] == "trusted-snapshot"
+    assert not lock_file.exists()
+
+
+def test_watch_interrupt_during_recovery_preserves_recoverable_state(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "now",
+    }
+    codex_handoff.write_status(
+        "RECOVERABLE_CHANGES",
+        recoverable_paths=["changed.py"],
+        recoverable_snapshot="trusted-snapshot",
+        **context,
+    )
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    monkeypatch.setattr(codex_handoff, "reconcile_stale_run", lambda: context)
+    monkeypatch.setattr(
+        codex_handoff,
+        "recover_changes",
+        lambda _context: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+    with pytest.raises(codex_handoff.RecoverableChangesError):
+        codex_handoff.run_watch(30)
+
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert status["recoverable_snapshot"] == "trusted-snapshot"
+    assert not lock_file.exists()
 
 
 def test_watch_polls_while_idle_and_stops_cleanly(
@@ -848,7 +2932,7 @@ def test_review_fix_loop_fixes_verifies_commits_and_reviews_again(
     monkeypatch.setattr(
         codex_handoff,
         "commit_review_fix",
-        lambda _issue, fix_round: events.append(("commit", fix_round)),
+        lambda _issue, fix_round, _context: events.append(("commit", fix_round)),
     )
 
     result = codex_handoff.run_review_fix_loop(issue, status_context)
@@ -896,6 +2980,7 @@ def test_run_reviewer_stops_on_command_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "REVIEW_SCHEMA_RUNTIME", tmp_path / "review.schema.json")
     commands: list[tuple[str, ...]] = []
     environments: list[dict[str, str]] = []
 
@@ -996,6 +3081,10 @@ def test_process_issue_verifies_before_pr_then_completes_independent_review(
     def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
         if args == ("git", "status", "--porcelain"):
             return subprocess.CompletedProcess(args, 0, stdout=" M changed.py\n", stderr="")
+        if args == ("git", "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+            return subprocess.CompletedProcess(args, 0, stdout=" M changed.py\0", stderr="")
+        if args == ("git", "write-tree"):
+            return subprocess.CompletedProcess(args, 0, stdout="tree-sha\n", stderr="")
         if args[:3] == ("git", "commit", "-m"):
             events.append("commit")
         if args[:3] == ("gh", "pr", "create"):
@@ -1027,6 +3116,7 @@ def test_process_issue_verifies_before_pr_then_completes_independent_review(
         lambda _number, add=None, remove=None: labels.append((add, remove)),
     )
     monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "comment_once", lambda *_args: None)
     monkeypatch.setattr(codex_handoff, "write_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         codex_handoff,
@@ -1066,12 +3156,18 @@ def test_process_issue_does_not_mark_pr_when_review_fails(
         nonlocal pr_marked
         if args == ("git", "status", "--porcelain"):
             return subprocess.CompletedProcess(args, 0, stdout=" M changed.py\n", stderr="")
+        if args == ("git", "status", "--porcelain=v1", "-z", "--untracked-files=all"):
+            return subprocess.CompletedProcess(args, 0, stdout=" M changed.py\0", stderr="")
+        if args == ("git", "write-tree"):
+            return subprocess.CompletedProcess(args, 0, stdout="tree-sha\n", stderr="")
         if args[:3] == ("gh", "pr", "create"):
             return subprocess.CompletedProcess(
                 args, 0, stdout="https://github.com/example/repo/pull/1\n", stderr=""
             )
         if args[:3] == ("gh", "pr", "edit"):
             pr_marked = True
+        if args == ("git", "rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, stdout="task-sha\n", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     monkeypatch.setattr(codex_handoff, "run", fake_run)
@@ -1088,6 +3184,7 @@ def test_process_issue_does_not_mark_pr_when_review_fails(
         lambda _number, add=None, remove=None: labels.append((add, remove)),
     )
     monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+    monkeypatch.setattr(codex_handoff, "comment_once", lambda *_args: None)
     monkeypatch.setattr(codex_handoff, "write_status", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="review failed"):

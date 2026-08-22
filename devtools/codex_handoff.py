@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -51,6 +54,14 @@ MAX_POLL_INTERVAL = 3600
 MAX_FIX_ROUNDS = 2
 MAX_REVIEW_RESULT_BYTES = 65_536
 MAX_REVIEW_FINDINGS = 20
+DEFAULT_CHILD_INACTIVITY_TIMEOUT = 1800
+CHILD_TERMINATION_GRACE = 10.0
+HEARTBEAT_CHECKPOINT_INTERVAL = 1.0
+LAUNCH_GATE_SCRIPT = (
+    "import os, sys; "
+    "gate = int(sys.argv[1]); token = os.read(gate, 1); os.close(gate); "
+    "sys.exit(125) if token != b'1' else os.execvpe(sys.argv[2], sys.argv[2:], os.environ)"
+)
 AUTO_MERGE_FIELDS = {
     "risk",
     "roadmap_authorized",
@@ -195,6 +206,14 @@ class MergeOutcome(TypedDict):
     sha: str | None
 
 
+class RecoverableChangesError(RuntimeError):
+    """Recovery stopped while preserved task work remains unresolved."""
+
+
+class ActiveOrphanError(RuntimeError):
+    """A proven orphan is still within its bounded output-inactivity window."""
+
+
 def now_iso() -> str:
     # timezone.utc keeps this standalone controller compatible with the documented Python 3.9.
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017
@@ -312,16 +331,6 @@ def acquire_lock() -> None:
         raise RuntimeError(f"Controller lock held by active controller PID {owner}") from None
 
     lock.seek(0)
-    try:
-        existing_pid = int(lock.read().strip())
-    except ValueError:
-        existing_pid = -1
-    if existing_pid != os.getpid() and pid_is_running(existing_pid):
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-        lock.close()
-        raise RuntimeError(f"Controller lock held by active controller PID {existing_pid}")
-
-    lock.seek(0)
     lock.truncate()
     lock.write(str(os.getpid()))
     lock.flush()
@@ -351,7 +360,21 @@ def write_status(
     started_at: str | None = None,
     detail: str | None = None,
     codex_pid: int | None = None,
+    last_child_output_at: str | None = None,
     pr_url: str | None = None,
+    recoverable_paths: list[str] | None = None,
+    recoverable_snapshot: str | None = None,
+    recoverable_content_snapshot: str | None = None,
+    finalization_checkpoint: str | None = None,
+    commit_sha: str | None = None,
+    pre_commit_sha: str | None = None,
+    pending_commit_subject: str | None = None,
+    recoverable_base_sha: str | None = None,
+    pending_tree_sha: str | None = None,
+    child_process_group: int | None = None,
+    child_process_identity: str | None = None,
+    child_inactivity_timeout: float | None = None,
+    reset_recovery: bool = False,
 ) -> None:
     previous: dict[str, object] = {}
     if STATUS_FILE.exists():
@@ -359,6 +382,7 @@ def write_status(
             previous = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             previous = {}
+    recovery_previous = {} if reset_recovery else previous
     payload = {
         "state": state,
         "issue": issue if issue is not None else previous.get("issue"),
@@ -368,11 +392,91 @@ def write_status(
         "updated_at": now_iso(),
         "controller_pid": os.getpid(),
         "codex_pid": codex_pid,
+        "last_child_output_at": (
+            last_child_output_at
+            if last_child_output_at is not None
+            else recovery_previous.get("last_child_output_at")
+        ),
         "log_file": str(log_file) if log_file else previous.get("log_file"),
         "detail": detail,
-        "pr_url": pr_url if pr_url is not None else previous.get("pr_url"),
+        "pr_url": pr_url if pr_url is not None else recovery_previous.get("pr_url"),
+        "recoverable_paths": (
+            recoverable_paths
+            if recoverable_paths is not None
+            else recovery_previous.get("recoverable_paths")
+        ),
+        "recoverable_snapshot": (
+            recoverable_snapshot
+            if recoverable_snapshot is not None
+            else recovery_previous.get("recoverable_snapshot")
+        ),
+        "recoverable_content_snapshot": (
+            recoverable_content_snapshot
+            if recoverable_content_snapshot is not None
+            else recovery_previous.get("recoverable_content_snapshot")
+        ),
+        "finalization_checkpoint": (
+            finalization_checkpoint
+            if finalization_checkpoint is not None
+            else recovery_previous.get("finalization_checkpoint")
+        ),
+        "commit_sha": (
+            commit_sha if commit_sha is not None else recovery_previous.get("commit_sha")
+        ),
+        "pre_commit_sha": (
+            pre_commit_sha
+            if pre_commit_sha is not None
+            else recovery_previous.get("pre_commit_sha")
+        ),
+        "pending_commit_subject": (
+            pending_commit_subject
+            if pending_commit_subject is not None
+            else recovery_previous.get("pending_commit_subject")
+        ),
+        "recoverable_base_sha": (
+            recoverable_base_sha
+            if recoverable_base_sha is not None
+            else recovery_previous.get("recoverable_base_sha")
+        ),
+        "pending_tree_sha": (
+            pending_tree_sha
+            if pending_tree_sha is not None
+            else recovery_previous.get("pending_tree_sha")
+        ),
+        "child_process_group": (
+            child_process_group
+            if child_process_group is not None
+            else recovery_previous.get("child_process_group")
+        ),
+        "child_process_identity": (
+            child_process_identity
+            if child_process_identity is not None
+            else recovery_previous.get("child_process_identity")
+        ),
+        "child_inactivity_timeout": (
+            child_inactivity_timeout
+            if child_inactivity_timeout is not None
+            else recovery_previous.get("child_inactivity_timeout")
+        ),
     }
-    STATUS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{STATUS_FILE.name}.", dir=STATUS_FILE.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(json.dumps(payload, indent=2) + "\n")
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, STATUS_FILE)
+        directory_fd = os.open(STATUS_FILE.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def show_status() -> int:
@@ -391,6 +495,8 @@ def show_status() -> int:
         print(f"Last update: {data['updated_at']}")
     if data.get("codex_pid"):
         print(f"Codex PID: {data['codex_pid']}")
+    if data.get("last_child_output_at"):
+        print(f"Last child output: {data['last_child_output_at']}")
     if data.get("pr_url"):
         print(f"PR: {data['pr_url']}")
     if data.get("detail"):
@@ -426,6 +532,135 @@ def next_issue() -> Issue | None:
     return issue
 
 
+def working_tree_paths() -> list[str]:
+    """Return every staged, unstaged, deleted, or untracked path deterministically."""
+    raw = run("git", "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+    entries = raw.split("\0")
+    paths: set[str] = set()
+    index = 0
+    while index < len(entries) and entries[index]:
+        entry = entries[index]
+        if len(entry) < 4 or entry[2] != " ":
+            raise RuntimeError("Cannot parse working-tree scope for recovery")
+        paths.add(entry[3:])
+        if "R" in entry[:2] or "C" in entry[:2]:
+            index += 1
+            if index >= len(entries) or not entries[index]:
+                raise RuntimeError("Cannot parse renamed working-tree path for recovery")
+            paths.add(entries[index])
+        index += 1
+    return sorted(paths)
+
+
+def recovery_snapshot(paths: list[str]) -> str:
+    """Hash Git status, index metadata, and working-tree content for exact recovery scope."""
+    digest = hashlib.sha256()
+    head = run("git", "rev-parse", "HEAD").stdout.strip()
+    if not head:
+        raise RuntimeError("Cannot snapshot recovery base HEAD")
+    digest.update(b"head\0" + head.encode())
+    status = run("git", "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+    digest.update(status.encode())
+    for path_text in sorted(paths):
+        path = Path(path_text)
+        if path.is_absolute() or ".." in path.parts:
+            raise RuntimeError("Cannot snapshot an unsafe recovery path")
+        digest.update(b"\0path\0" + path_text.encode())
+        index = run("git", "ls-files", "--stage", "-z", "--", path_text, check=False).stdout
+        digest.update(b"\0index\0" + index.encode())
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            digest.update(b"\0missing")
+            continue
+        digest.update(f"\0mode\0{metadata.st_mode:o}".encode())
+        if path.is_symlink():
+            digest.update(b"\0symlink\0" + os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(b"\0file\0")
+            with path.open("rb") as source:
+                while chunk := source.read(1_048_576):
+                    digest.update(chunk)
+        else:
+            digest.update(b"\0other")
+    return digest.hexdigest()
+
+
+def recovery_content_snapshot(paths: list[str]) -> str:
+    """Hash path identity and working-tree content without mutable index state."""
+    digest = hashlib.sha256()
+    for path_text in sorted(paths):
+        path = Path(path_text)
+        if path.is_absolute() or ".." in path.parts:
+            raise RuntimeError("Cannot snapshot an unsafe recovery path")
+        digest.update(b"\0path\0" + path_text.encode())
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            digest.update(b"\0missing")
+            continue
+        digest.update(f"\0mode\0{metadata.st_mode:o}".encode())
+        if path.is_symlink():
+            digest.update(b"\0symlink\0" + os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(b"\0file\0")
+            with path.open("rb") as source:
+                while chunk := source.read(1_048_576):
+                    digest.update(chunk)
+        else:
+            digest.update(b"\0other")
+    return digest.hexdigest()
+
+
+def captured_recovery_scope() -> tuple[list[str] | None, str | None]:
+    paths = working_tree_paths()
+    if not paths:
+        return None, None
+    return paths, recovery_snapshot(paths)
+
+
+def validate_recovery_scope() -> None:
+    """Require the current dirty paths to exactly match the child-captured manifest."""
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("Cannot prove recovery working-tree scope") from exc
+    expected = status.get("recoverable_paths") if isinstance(status, dict) else None
+    expected_snapshot = status.get("recoverable_snapshot") if isinstance(status, dict) else None
+    expected_content = (
+        status.get("recoverable_content_snapshot") if isinstance(status, dict) else None
+    )
+    checkpoint = status.get("finalization_checkpoint") if isinstance(status, dict) else None
+    if expected is None or (expected_snapshot is None and expected_content is None):
+        raise RuntimeError(
+            "Legacy recovery has no child-captured content manifest; "
+            "explicit operator confirmation is required"
+        )
+    if not (
+        isinstance(expected, list)
+        and expected
+        and all(isinstance(path, str) and path for path in expected)
+        and working_tree_paths() == sorted(set(expected))
+    ):
+        raise RuntimeError(
+            "Cannot prove recovery working-tree scope; refusing to stage preserved changes"
+        )
+    exact_snapshot_matches = isinstance(expected_snapshot, str) and (
+        recovery_snapshot(expected) == expected_snapshot
+    )
+    staged_content_matches = (
+        checkpoint in {"STAGING", "STAGED"}
+        and isinstance(expected_content, str)
+        and isinstance(status.get("recoverable_base_sha"), str)
+        and run("git", "rev-parse", "HEAD").stdout.strip() == status.get("recoverable_base_sha")
+        and recovery_content_snapshot(expected) == expected_content
+    )
+    if not exact_snapshot_matches and not staged_content_matches:
+        raise RuntimeError(
+            "Cannot prove recovery working-tree scope; refusing to stage preserved changes"
+        )
+
+
 def slugify(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return (slug[:48] or "task").rstrip("-")
@@ -444,6 +679,20 @@ def label(issue_number: int, add: str | None = None, remove: str | None = None) 
 
 def comment(issue_number: int, text: str) -> None:
     run("gh", "issue", "comment", str(issue_number), "--repo", REPO, "--body", text)
+
+
+def comment_once(issue_number: int, event: str, text: str) -> None:
+    """Publish one auditable issue event even when recovery retries."""
+    if not re.fullmatch(r"[a-z0-9-]+", event):
+        raise ValueError("Invalid audit comment event marker")
+    marker = f"<!-- growth-os-codex-handoff:{event} -->"
+    payload = gh_json("issue", "view", str(issue_number), "--repo", REPO, "--json", "comments")
+    comments = payload.get("comments") if isinstance(payload, dict) else None
+    if not isinstance(comments, list):
+        raise RuntimeError("GitHub returned invalid issue comments for audit deduplication")
+    if any(isinstance(item, dict) and marker in str(item.get("body", "")) for item in comments):
+        return
+    comment(issue_number, f"{text}\n\n{marker}")
 
 
 def prepare_task_branch(branch: str) -> None:
@@ -477,32 +726,460 @@ def run_codex_stream(
     command: tuple[str, ...] = ("codex", "exec", "--sandbox", "workspace-write"),
     state: str = "IMPLEMENTING",
     env: dict[str, str] | None = None,
+    inactivity_timeout: float = DEFAULT_CHILD_INACTIVITY_TIMEOUT,
+    termination_grace: float = CHILD_TERMINATION_GRACE,
 ) -> tuple[int, str]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     tail: list[str] = []
     with log_file.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
+        child_base_sha = run("git", "rev-parse", "HEAD").stdout.strip()
+        if not child_base_sha:
+            raise RuntimeError("Could not record Codex child base HEAD")
+        write_status(
+            "LAUNCHING",
+            codex_pid=None,
+            log_file=log_file,
+            recoverable_base_sha=child_base_sha,
+            reset_recovery=state in {"IMPLEMENTING", "FIXING"},
+            **status_context,
         )
-        write_status(state, codex_pid=process.pid, log_file=log_file, **status_context)
-        assert process.stdin is not None
-        process.stdin.write(prompt)
-        process.stdin.close()
-        assert process.stdout is not None
-        for line in process.stdout:
-            log.write(line)
-            log.flush()
-            tail.append(line)
-            if len(tail) > 100:
-                tail.pop(0)
-        return_code = process.wait()
+        gate_read, gate_write = os.pipe()
+        try:
+            process = subprocess.Popen(
+                (sys.executable, "-c", LAUNCH_GATE_SCRIPT, str(gate_read), *command),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+                start_new_session=True,
+                pass_fds=(gate_read,),
+            )
+        except BaseException:
+            os.close(gate_read)
+            os.close(gate_write)
+            raise
+        os.close(gate_read)
+        gate_open = True
+        finalized = False
+        stdin_open = False
+        try:
+            heartbeat = now_iso()
+            child_identity = process_group_identity(process.pid)
+            if child_identity is None:
+                raise RuntimeError("Could not record Codex child process-group identity")
+            recovery_paths, recovery_digest = captured_recovery_scope()
+            write_status(
+                state,
+                codex_pid=process.pid,
+                log_file=log_file,
+                last_child_output_at=heartbeat,
+                recoverable_paths=recovery_paths,
+                recoverable_snapshot=recovery_digest,
+                child_process_group=process.pid,
+                child_process_identity=child_identity,
+                child_inactivity_timeout=inactivity_timeout,
+                recoverable_base_sha=child_base_sha,
+                reset_recovery=state in {"IMPLEMENTING", "FIXING"},
+                **status_context,
+            )
+            os.write(gate_write, b"1")
+            os.close(gate_write)
+            gate_open = False
+            assert process.stdin is not None
+            assert process.stdout is not None
+            prompt_bytes = prompt.encode()
+            prompt_offset = 0
+            stdin_fd = process.stdin.fileno()
+            os.set_blocking(stdin_fd, False)
+            stdin_open = True
+            if not prompt_bytes:
+                process.stdin.close()
+                stdin_open = False
+            deadline = time.monotonic() + inactivity_timeout
+            next_heartbeat_checkpoint = time.monotonic() + HEARTBEAT_CHECKPOINT_INTERVAL
+            while process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    message = f"Codex child exceeded {inactivity_timeout:g}s inactivity timeout\n"
+                    log.write(message)
+                    log.flush()
+                    tail.append(message)
+                    terminate_process_group(process, termination_grace)
+                    recovery_paths, recovery_digest = captured_recovery_scope()
+                    write_status(
+                        state,
+                        codex_pid=None,
+                        log_file=log_file,
+                        detail=message.strip(),
+                        recoverable_paths=recovery_paths,
+                        recoverable_snapshot=recovery_digest,
+                        **status_context,
+                    )
+                    finalized = True
+                    return process.returncode, "".join(tail)
+                writers = [process.stdin] if stdin_open else []
+                readable, writable, _ = select.select(
+                    [process.stdout], writers, [], min(1.0, remaining)
+                )
+                if writable:
+                    try:
+                        written = os.write(
+                            stdin_fd, prompt_bytes[prompt_offset : prompt_offset + 65_536]
+                        )
+                    except BlockingIOError:
+                        written = 0
+                    except BrokenPipeError:
+                        written = 0
+                        process.stdin.close()
+                        stdin_open = False
+                    if written:
+                        prompt_offset += written
+                        if prompt_offset == len(prompt_bytes):
+                            process.stdin.close()
+                            stdin_open = False
+                if readable:
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    if not chunk:
+                        continue
+                    output = chunk.decode(errors="replace")
+                    log.write(output)
+                    log.flush()
+                    tail.append(output)
+                    if len(tail) > 100:
+                        tail.pop(0)
+                    heartbeat = now_iso()
+                    output_time = time.monotonic()
+                    deadline = output_time + inactivity_timeout
+                    if output_time >= next_heartbeat_checkpoint:
+                        write_status(
+                            state,
+                            codex_pid=process.pid,
+                            log_file=log_file,
+                            last_child_output_at=heartbeat,
+                            **status_context,
+                        )
+                        next_heartbeat_checkpoint = output_time + HEARTBEAT_CHECKPOINT_INTERVAL
+            return_code = process.wait()
+            if stdin_open:
+                process.stdin.close()
+                stdin_open = False
+            terminate_process_group(process, termination_grace)
+            recovery_paths, recovery_digest = captured_recovery_scope()
+            write_status(
+                state,
+                codex_pid=None,
+                log_file=log_file,
+                recoverable_paths=recovery_paths,
+                recoverable_snapshot=recovery_digest,
+                **status_context,
+            )
+            finalized = True
+        finally:
+            if gate_open:
+                os.close(gate_write)
+            if not finalized:
+                if stdin_open and process.stdin is not None:
+                    process.stdin.close()
+                terminate_process_group(process, termination_grace)
+                recovery_paths, recovery_digest = captured_recovery_scope()
+                write_status(
+                    state,
+                    codex_pid=None,
+                    log_file=log_file,
+                    detail="Codex child interrupted; preserved changes require recovery",
+                    recoverable_paths=recovery_paths,
+                    recoverable_snapshot=recovery_digest,
+                    **status_context,
+                )
     return return_code, "".join(tail)
+
+
+def terminate_process_group(process: subprocess.Popen[str], termination_grace: float) -> None:
+    """Terminate the isolated child process group before recovery inspects the workspace."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    process.poll()
+    deadline = time.monotonic() + termination_grace
+    while process_group_is_running(process.pid) and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        process.poll()
+    process.poll()
+    if process_group_is_running(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + termination_grace
+    while process_group_is_running(process.pid) and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        process.poll()
+    if process_group_is_running(process.pid):
+        raise RuntimeError("Codex child process group did not terminate")
+    try:
+        process.wait(timeout=termination_grace)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Codex child process leader did not terminate") from exc
+
+
+def process_group_identity(pid: int) -> str | None:
+    """Return stable OS evidence for the isolated process-group leader."""
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "pgid=,lstart="],
+        capture_output=True,
+        text=True,
+    )
+    identity = result.stdout.strip()
+    if result.returncode != 0 or not identity:
+        return None
+    pgid = identity.split(maxsplit=1)[0]
+    return identity if pgid == str(pid) else None
+
+
+def heartbeat_is_stale(value: object, timeout: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or timeout <= 0
+    ):
+        raise RuntimeError("Cannot prove the orphaned child inactivity deadline")
+    try:
+        heartbeat = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise RuntimeError("Cannot parse the orphaned child heartbeat") from exc
+    if heartbeat.tzinfo is None:
+        raise RuntimeError("Orphaned child heartbeat is not timezone-aware")
+    return (datetime.now(timezone.utc) - heartbeat).total_seconds() >= float(timeout)  # noqa: UP017
+
+
+def process_group_is_running(process_group: int) -> bool:
+    """Return whether any process still belongs to the recorded process group."""
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_orphan_process_group(pid: int, termination_grace: float) -> None:
+    """Terminate a proven stale orphan process group before inspecting recovery scope."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + termination_grace
+    while process_group_is_running(pid) and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    if process_group_is_running(pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    deadline = time.monotonic() + termination_grace
+    while process_group_is_running(pid) and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    if process_group_is_running(pid):
+        raise RuntimeError("Orphaned Codex process group did not terminate")
+
+
+def recovery_blocked_error(
+    context: StatusContext, detail: str, *, codex_pid: int | None = None
+) -> RuntimeError:
+    """Durably leave an active stale state before failing closed."""
+    write_status("RECOVERY_BLOCKED", codex_pid=codex_pid, detail=detail, **context)
+    return RuntimeError(detail)
+
+
+def reconcile_stale_run() -> StatusContext | None:
+    """Fail closed or surface preserved work from an interrupted implementation."""
+    if not STATUS_FILE.exists():
+        return None
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("Handoff status is unreadable; refusing startup recovery") from exc
+    if not isinstance(status, dict) or status.get("state") not in {
+        "IMPLEMENTING",
+        "FIXING",
+        "RECOVERABLE_CHANGES",
+        "COMMITTING",
+        "COMMITTED",
+        "PUSHING",
+        "PUSHED",
+        "PR_CREATED",
+        "VERIFYING",
+        "REVIEWING",
+        "REVIEW_PASSED",
+        "RECOVERY_BLOCKED",
+        "RECOVERY_CONFIRMATION_REQUIRED",
+        "LAUNCHING",
+        "SYNCING",
+    }:
+        return None
+
+    issue = status.get("issue")
+    title = status.get("title")
+    branch = status.get("branch")
+    started_at = status.get("started_at")
+    if type(issue) is not int or not all(
+        isinstance(value, str) and value for value in (title, branch, started_at)
+    ):
+        raise RuntimeError("Stale implementation status cannot prove task ownership")
+    context: StatusContext = {
+        "issue": issue,
+        "title": cast(str, title),
+        "branch": cast(str, branch),
+        "started_at": cast(str, started_at),
+    }
+    if status["state"] == "RECOVERY_CONFIRMATION_REQUIRED":
+        raise RuntimeError(
+            "Recovery requires explicit operator confirmation via --confirm-recovery"
+        )
+    pid = status.get("codex_pid")
+    stopped_child_scope_is_proven = False
+    if (
+        status["state"]
+        in {
+            "IMPLEMENTING",
+            "FIXING",
+            "REVIEWING",
+            "RECOVERY_BLOCKED",
+        }
+        and type(pid) is int
+    ):
+        group = status.get("child_process_group")
+        identity = status.get("child_process_identity")
+        if type(group) is int and group == pid and isinstance(identity, str):
+            group_running = process_group_is_running(group)
+        elif pid_is_running(pid):
+            raise recovery_blocked_error(
+                context,
+                "Cannot prove live orphaned Codex process-group identity",
+                codex_pid=pid,
+            )
+        else:
+            group_running = False
+        if group_running:
+            if not pid_is_running(pid) or process_group_identity(pid) != identity:
+                detail = (
+                    "Recovery blocked: a live recorded process group has no provable leader "
+                    "identity; no signal was sent"
+                )
+                raise recovery_blocked_error(context, detail, codex_pid=pid)
+            if not heartbeat_is_stale(
+                status.get("last_child_output_at"), status.get("child_inactivity_timeout")
+            ):
+                raise ActiveOrphanError(
+                    f"Recorded Codex process group {group} is still active; refusing recovery"
+                )
+            terminate_orphan_process_group(cast(int, group), CHILD_TERMINATION_GRACE)
+        if type(group) is int and group == pid and isinstance(identity, str):
+            stopped_child_scope_is_proven = True
+
+    current_branch = run("git", "branch", "--show-current").stdout.strip()
+    if current_branch != branch:
+        raise recovery_blocked_error(
+            context,
+            "Cannot prove recovery branch identity: "
+            f"status records {branch!r}, checkout is {current_branch!r}",
+            codex_pid=pid if type(pid) is int else None,
+        )
+    if stopped_child_scope_is_proven:
+        recorded_base = status.get("recoverable_base_sha")
+        current_head = run("git", "rev-parse", "HEAD").stdout.strip()
+        if not isinstance(recorded_base, str) or not recorded_base or current_head != recorded_base:
+            raise recovery_blocked_error(
+                context,
+                "Cannot prove the stopped Codex child's task base HEAD",
+                codex_pid=pid if type(pid) is int else None,
+            )
+    has_changes = bool(run("git", "status", "--porcelain").stdout.strip())
+    checkpoint = status.get("finalization_checkpoint")
+    has_trusted_manifest = (
+        isinstance(status.get("recoverable_paths"), list)
+        and bool(status.get("recoverable_paths"))
+        and (
+            isinstance(status.get("recoverable_snapshot"), str)
+            or isinstance(status.get("recoverable_content_snapshot"), str)
+        )
+    )
+    if status["state"] == "COMMITTING" and not has_changes and checkpoint == "STAGED":
+        pre_commit_sha = status.get("pre_commit_sha")
+        current_head = run("git", "rev-parse", "HEAD").stdout.strip()
+        parent_head = run("git", "rev-parse", "HEAD^").stdout.strip()
+        subject = run("git", "log", "-1", "--pretty=%s").stdout.strip()
+        recorded_subject = status.get("pending_commit_subject")
+        pending_tree_sha = status.get("pending_tree_sha")
+        current_tree_sha = run("git", "rev-parse", "HEAD^{tree}").stdout.strip()
+        allowed_subjects = {
+            f"codex: resolve issue #{issue}",
+            *(
+                f"codex: address review round {round_number} for #{issue}"
+                for round_number in (1, 2)
+            ),
+        }
+        expected_subject = (
+            recorded_subject
+            if isinstance(recorded_subject, str) and recorded_subject in allowed_subjects
+            else f"codex: resolve issue #{issue}"
+        )
+        if (
+            isinstance(pre_commit_sha, str)
+            and pre_commit_sha
+            and current_head
+            and parent_head == pre_commit_sha
+            and subject == expected_subject
+            and isinstance(pending_tree_sha, str)
+            and pending_tree_sha
+            and current_tree_sha == pending_tree_sha
+        ):
+            write_status(
+                "RECOVERABLE_CHANGES",
+                detail="Recovered a proven commit created before its checkpoint was recorded",
+                finalization_checkpoint="COMMITTED",
+                commit_sha=current_head,
+                **context,
+            )
+            return context
+        raise RuntimeError("Cannot prove the commit created by an interrupted finalization")
+    if not has_changes and checkpoint not in {"COMMITTED", "PUSHED", "PR_CREATED"}:
+        failure = RuntimeError("Interrupted Codex implementation left no working-tree changes")
+        write_status("RECOVERY_BLOCKED", detail=str(failure), **context)
+        issue_payload = load_recovery_issue(context)
+        record_issue_failure(issue_payload, failure)
+        raise failure
+
+    if has_changes and not stopped_child_scope_is_proven and not has_trusted_manifest:
+        detail = (
+            "Legacy preserved work lacks attributable content provenance; explicit operator "
+            "confirmation is required"
+        )
+        write_status("RECOVERY_CONFIRMATION_REQUIRED", detail=detail, **context)
+        raise RuntimeError(detail)
+    if has_changes and stopped_child_scope_is_proven:
+        detail = (
+            "Stopped child work lacks a final durable content manifest; explicit operator "
+            "confirmation is required"
+        )
+        write_status(
+            "RECOVERY_CONFIRMATION_REQUIRED",
+            codex_pid=pid if type(pid) is int else None,
+            detail=detail,
+            **context,
+        )
+        raise RuntimeError(detail)
+    write_status(
+        "RECOVERABLE_CHANGES",
+        detail="Preserved task work from an interrupted Codex run; recovery required",
+        **context,
+    )
+    return context
 
 
 def _review_result_error(detail: str) -> RuntimeError:
@@ -982,15 +1659,94 @@ repository changes for the controller to verify.
 """
     return_code, output_tail = run_codex_stream(prompt, log_file, status_context, state="FIXING")
     if return_code != 0:
+        paths, snapshot = captured_recovery_scope()
+        if paths:
+            write_status(
+                "RECOVERABLE_CHANGES",
+                log_file=log_file,
+                detail=f"Fixer exited with {return_code}; preserved changes require recovery",
+                recoverable_paths=paths,
+                recoverable_snapshot=snapshot,
+                **status_context,
+            )
+            raise RecoverableChangesError(
+                f"Fixer exited with {return_code}; preserved task changes require recovery"
+            )
         raise RuntimeError(f"Fixer exited with {return_code}:\n{output_tail[-3000:]}")
     if not run("git", "status", "--porcelain").stdout.strip():
         raise RuntimeError("Reviewer fixer produced no changes")
 
 
-def commit_review_fix(issue: Issue, fix_round: int) -> None:
-    run("git", "add", "-A")
-    run("git", "commit", "-m", f"codex: address review round {fix_round} for #{issue['number']}")
+def commit_review_fix(issue: Issue, fix_round: int, status_context: StatusContext) -> None:
+    subject = f"codex: address review round {fix_round} for #{issue['number']}"
+    commit_sha = commit_with_recovery_checkpoint(
+        issue,
+        status_context,
+        subject=subject,
+        detail=f"Review fix round {fix_round}",
+    )
     run("git", "push")
+    write_status(
+        "PUSHED",
+        detail=f"Review fix round {fix_round} pushed",
+        finalization_checkpoint="PUSHED",
+        commit_sha=commit_sha,
+        **status_context,
+    )
+
+
+def commit_with_recovery_checkpoint(
+    issue: Issue,
+    status_context: StatusContext,
+    *,
+    subject: str,
+    detail: str,
+    log_file: Path | None = None,
+) -> str:
+    """Stage and commit with provenance for both adjacent crash windows."""
+    pre_commit_sha = run("git", "rev-parse", "HEAD").stdout.strip()
+    if not pre_commit_sha:
+        raise RuntimeError("Could not record the pre-commit recovery checkpoint")
+    recovery_paths = working_tree_paths()
+    if not recovery_paths:
+        raise RuntimeError("Cannot record an empty pre-staging recovery checkpoint")
+    write_status(
+        "COMMITTING",
+        log_file=log_file,
+        detail=f"{detail}: staging changes",
+        pre_commit_sha=pre_commit_sha,
+        pending_commit_subject=subject,
+        finalization_checkpoint="STAGING",
+        recoverable_paths=recovery_paths,
+        recoverable_content_snapshot=recovery_content_snapshot(recovery_paths),
+        recoverable_base_sha=pre_commit_sha,
+        **status_context,
+    )
+    run("git", "add", "-A")
+    pending_tree_sha = run("git", "write-tree").stdout.strip()
+    if not pending_tree_sha:
+        raise RuntimeError("Could not record the staged tree recovery checkpoint")
+    write_status(
+        "COMMITTING",
+        log_file=log_file,
+        detail=f"{detail}: committing staged tree",
+        finalization_checkpoint="STAGED",
+        pending_tree_sha=pending_tree_sha,
+        **status_context,
+    )
+    run("git", "commit", "-m", subject)
+    commit_sha = run("git", "rev-parse", "HEAD").stdout.strip()
+    if not commit_sha:
+        raise RuntimeError("Could not record the commit recovery checkpoint")
+    write_status(
+        "COMMITTED",
+        log_file=log_file,
+        detail=f"{detail}: changes committed",
+        finalization_checkpoint="COMMITTED",
+        commit_sha=commit_sha,
+        **status_context,
+    )
+    return commit_sha
 
 
 def mark_pr_review_passed(pr_url: str) -> None:
@@ -1008,8 +1764,345 @@ def run_review_fix_loop(issue: Issue, status_context: StatusContext) -> ReviewRe
             raise RuntimeError("Reviewer still found defects after two fix rounds")
         run_fixer(issue, result["findings"], status_context, review_round)
         run_verification(issue, status_context, review_round + 1)
-        commit_review_fix(issue, review_round)
+        commit_review_fix(issue, review_round, status_context)
     raise AssertionError("unreachable review loop state")
+
+
+def find_draft_pr(branch: str) -> str | None:
+    """Discover the single open draft PR for a task branch, if one exists."""
+    payload = gh_json(
+        "pr",
+        "list",
+        "--repo",
+        REPO,
+        "--state",
+        "open",
+        "--head",
+        branch,
+        "--json",
+        "url,isDraft",
+    )
+    if not isinstance(payload, list) or len(payload) > 1:
+        raise RuntimeError("Cannot uniquely identify the recovery draft PR")
+    if not payload:
+        return None
+    pr = payload[0]
+    if (
+        not isinstance(pr, dict)
+        or pr.get("isDraft") is not True
+        or not isinstance(pr.get("url"), str)
+    ):
+        raise RuntimeError("Existing recovery PR is not a proven draft PR")
+    return cast(str, pr["url"])
+
+
+def remote_branch_head(branch: str) -> str | None:
+    """Resolve exactly one remote task-branch head without updating local refs."""
+    output = run("git", "ls-remote", "--heads", "origin", branch).stdout.strip()
+    if not output:
+        return None
+    lines = output.splitlines()
+    expected_ref = f"refs/heads/{branch}"
+    matches = [line.split() for line in lines]
+    if len(matches) != 1 or len(matches[0]) != 2 or matches[0][1] != expected_ref:
+        raise RuntimeError("Cannot uniquely prove the remote recovery branch head")
+    return matches[0][0]
+
+
+def validate_committed_recovery_checkpoint(
+    status: dict[str, object], branch: str, completed: int
+) -> None:
+    """Prove local, remote, and PR revisions before executing repository code."""
+    commit_sha = status.get("commit_sha")
+    if not isinstance(commit_sha, str) or not commit_sha:
+        raise RuntimeError("Recovery commit checkpoint is missing")
+    if run("git", "rev-parse", "HEAD").stdout.strip() != commit_sha:
+        raise RuntimeError("Recovery commit checkpoint does not match the current HEAD")
+    if completed >= 2 and remote_branch_head(branch) != commit_sha:
+        raise RuntimeError("Recovery push checkpoint does not match the remote branch head")
+    if completed >= 3:
+        pr_url = status.get("pr_url")
+        if not isinstance(pr_url, str) or not pr_url:
+            raise RuntimeError("Recovery draft PR checkpoint is missing")
+        metadata = _pr_metadata(pr_url)
+        expected = {
+            "url": pr_url,
+            "state": "OPEN",
+            "isDraft": True,
+            "baseRefName": "main",
+            "headRefName": branch,
+            "headRefOid": commit_sha,
+        }
+        if any(metadata.get(field) != value for field, value in expected.items()):
+            raise RuntimeError("Recovery draft PR checkpoint does not match its recorded revision")
+
+
+def finalize_changes(
+    issue: Issue,
+    status_context: StatusContext,
+    log_file: Path,
+    *,
+    allow_merge: bool,
+    recovering: bool = False,
+) -> None:
+    """Verify preserved changes and complete the normal commit/push/draft-PR workflow."""
+    number = int(issue["number"])
+    title = issue["title"]
+    branch = status_context["branch"]
+    status = (
+        json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        if recovering and STATUS_FILE.exists()
+        else {}
+    )
+    checkpoint = status.get("finalization_checkpoint") if isinstance(status, dict) else None
+    commit_sha = status.get("commit_sha") if isinstance(status, dict) else None
+    completed = {"COMMITTED": 1, "PUSHED": 2, "PR_CREATED": 3}.get(str(checkpoint), 0)
+    if recovering:
+        if completed == 0:
+            validate_recovery_scope()
+        else:
+            if working_tree_paths():
+                raise RuntimeError(
+                    "Cannot resume finalization with uncommitted working-tree changes"
+                )
+            validate_committed_recovery_checkpoint(status, branch, completed)
+    run_verification(issue, status_context, 1)
+    if recovering and completed == 0:
+        validate_recovery_scope()
+    elif recovering and working_tree_paths():
+        raise RuntimeError("Recovery verification dirtied a committed checkpoint")
+
+    if completed == 0:
+        commit_sha = commit_with_recovery_checkpoint(
+            issue,
+            status_context,
+            subject=f"codex: resolve issue #{number}",
+            detail="Initial implementation",
+            log_file=log_file,
+        )
+        completed = 1
+    elif not isinstance(commit_sha, str):
+        raise RuntimeError("Recovery commit checkpoint is invalid")
+
+    if completed < 2:
+        write_status("PUSHING", log_file=log_file, detail="Pushing task branch", **status_context)
+        run("git", "push", "-u", "origin", branch)
+        write_status(
+            "PUSHED",
+            log_file=log_file,
+            detail="Task branch pushed",
+            finalization_checkpoint="PUSHED",
+            commit_sha=commit_sha,
+            **status_context,
+        )
+        completed = 2
+
+    pr_body = (
+        f"Automated local Codex handoff for #{number}.\n\nCloses #{number}.\n\n"
+        "This PR was created by the self-hosted controller. It is intentionally a draft. "
+        "It must pass independent review and the bounded merge policy before merge. "
+        "No production deployment is authorized."
+    )
+    pr_url = find_draft_pr(branch) if recovering else None
+    recorded_pr = status.get("pr_url") if isinstance(status, dict) else None
+    if completed >= 3 and (not isinstance(recorded_pr, str) or pr_url != recorded_pr):
+        raise RuntimeError("Recovery draft PR checkpoint cannot be proven")
+    if pr_url is None:
+        pr_url = run(
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            REPO,
+            "--base",
+            "main",
+            "--head",
+            branch,
+            "--draft",
+            "--title",
+            title,
+            "--body",
+            pr_body,
+        ).stdout.strip()
+        if not pr_url:
+            raise RuntimeError("GitHub did not return the created draft PR URL")
+
+    write_status(
+        "PR_CREATED",
+        log_file=log_file,
+        detail="Draft PR opened",
+        pr_url=pr_url,
+        finalization_checkpoint="PR_CREATED",
+        commit_sha=commit_sha,
+        **status_context,
+    )
+    comment_once(
+        number, "draft-pr-opened", f"Codex opened a draft PR for independent review: {pr_url}"
+    )
+    run_review_fix_loop(issue, status_context)
+    mark_pr_review_passed(pr_url)
+    write_status(
+        "REVIEW_PASSED",
+        detail="Independent review passed with zero findings",
+        pr_url=pr_url,
+        **status_context,
+    )
+    comment_once(
+        number,
+        "independent-review-passed",
+        f"Independent review passed with zero findings: {pr_url}",
+    )
+    label(number, add=REVIEWED_LABEL)
+    reviewed_head = run("git", "rev-parse", "HEAD").stdout.strip()
+    if not reviewed_head:
+        raise RuntimeError("Could not resolve the exact reviewed HEAD commit")
+    outcome: MergeOutcome
+    if allow_merge:
+        outcome = merge_reviewed_pr(issue, branch, pr_url, reviewed_head, status_context)
+    else:
+        outcome = {
+            "merged": False,
+            "reasons": ["Recovery never auto-merges preserved work"],
+            "sha": None,
+        }
+    if outcome["merged"]:
+        merge_sha = outcome["sha"]
+        write_status(
+            "MERGED",
+            detail=f"Eligible reviewed PR merged at {merge_sha}",
+            pr_url=pr_url,
+            **status_context,
+        )
+        comment_once(
+            number,
+            "auto-merge-completed",
+            f"Bounded auto-merge completed at `{merge_sha}`: {pr_url}",
+        )
+        label(number, add=MERGED_LABEL)
+    else:
+        reason_text = "; ".join(outcome["reasons"])
+        write_status("MERGE_BLOCKED", detail=reason_text, pr_url=pr_url, **status_context)
+        comment_once(
+            number,
+            "auto-merge-stopped",
+            f"Auto-merge stopped safely; reviewed PR remains open: {reason_text}",
+        )
+        label(number, add=MERGE_BLOCKED_LABEL)
+    label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
+
+
+def load_recovery_issue(status_context: StatusContext) -> Issue:
+    """Reload the exact owner-authored open issue recorded by the interrupted run."""
+    number = status_context["issue"]
+    payload = gh_json(
+        "issue",
+        "view",
+        str(number),
+        "--repo",
+        REPO,
+        "--json",
+        "number,title,body,author,state,url",
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("Cannot prove recovery task ownership from GitHub")
+    author = payload.get("author")
+    if (
+        type(payload.get("number")) is not int
+        or payload["number"] != number
+        or payload.get("title") != status_context["title"]
+        or payload.get("state") != "OPEN"
+        or not isinstance(author, dict)
+        or str(author.get("login", "")).lower() != OWNER.lower()
+    ):
+        raise RuntimeError("Cannot prove recovery task ownership from GitHub")
+    return cast(Issue, payload)
+
+
+def recover_changes(status_context: StatusContext) -> None:
+    """Finalize preserved implementation work without invoking Codex implementation again."""
+    issue = load_recovery_issue(status_context)
+    number = status_context["issue"]
+    log_file = LOG_DIR / f"recovery-{number}.log"
+    comment_once(
+        number,
+        "recovery-started",
+        "Recovering preserved task changes without rerunning implementation.",
+    )
+    try:
+        finalize_changes(issue, status_context, log_file, allow_merge=False, recovering=True)
+    except Exception as exc:
+        write_status(
+            "RECOVERABLE_CHANGES",
+            detail=f"Recovery stopped; preserved changes remain: {str(exc)[-700:]}",
+            **status_context,
+        )
+        raise RecoverableChangesError(str(exc)) from exc
+
+
+def confirm_recovery() -> int:
+    """Explicitly authorize the current stopped-child scope and finalize it safely."""
+    ensure_tools()
+    ensure_labels()
+    acquire_lock()
+    try:
+        try:
+            status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise RuntimeError("Recovery confirmation status is unreadable") from exc
+        if not isinstance(status, dict) or status.get("state") != (
+            "RECOVERY_CONFIRMATION_REQUIRED"
+        ):
+            raise RuntimeError("No recovery is awaiting explicit operator confirmation")
+        issue = status.get("issue")
+        title = status.get("title")
+        branch = status.get("branch")
+        started_at = status.get("started_at")
+        if type(issue) is not int or not all(
+            isinstance(value, str) and value for value in (title, branch, started_at)
+        ):
+            raise RuntimeError("Cannot prove the recovery confirmation task context")
+        context: StatusContext = {
+            "issue": issue,
+            "title": cast(str, title),
+            "branch": cast(str, branch),
+            "started_at": cast(str, started_at),
+        }
+        load_recovery_issue(context)
+        pid = status.get("codex_pid")
+        group = status.get("child_process_group")
+        identity = status.get("child_process_identity")
+        instrumented = (
+            type(pid) is int and type(group) is int and group == pid and isinstance(identity, str)
+        )
+        if instrumented:
+            if pid_is_running(cast(int, pid)) or process_group_is_running(cast(int, group)):
+                raise RuntimeError(
+                    "Cannot prove the confirmed Codex child process group is stopped"
+                )
+        elif (type(pid) is int and pid_is_running(pid)) or (
+            type(group) is int and process_group_is_running(group)
+        ):
+            raise RuntimeError("Legacy recovery still records a live process or process group")
+        if run("git", "branch", "--show-current").stdout.strip() != branch:
+            raise RuntimeError("Cannot prove the recovery confirmation branch")
+        base = status.get("recoverable_base_sha")
+        if isinstance(base, str) and run("git", "rev-parse", "HEAD").stdout.strip() != base:
+            raise RuntimeError("Cannot prove the recovery confirmation base HEAD")
+        paths, snapshot = captured_recovery_scope()
+        if not paths or not snapshot:
+            raise RuntimeError("Recovery confirmation found no preserved working-tree changes")
+        write_status(
+            "RECOVERABLE_CHANGES",
+            codex_pid=None,
+            detail="Operator confirmed the stopped child's current recovery scope",
+            recoverable_paths=paths,
+            recoverable_snapshot=snapshot,
+            **context,
+        )
+        recover_changes(context)
+        return 0
+    finally:
+        release_lock()
 
 
 def process_issue(issue: Issue) -> None:
@@ -1026,7 +2119,13 @@ def process_issue(issue: Issue) -> None:
         "started_at": started_at,
     }
 
-    write_status("SYNCING", log_file=log_file, detail="Preparing task branch", **status_context)
+    write_status(
+        "SYNCING",
+        log_file=log_file,
+        detail="Preparing task branch",
+        reset_recovery=True,
+        **status_context,
+    )
     label(number, add=RUNNING_LABEL, remove=READY_LABEL)
     comment(number, f"Local Codex controller started this task on branch `{branch}`.")
     prepare_task_branch(branch)
@@ -1064,8 +2163,37 @@ Finish with a concise implementation summary covering files changed, architectur
 checks run and results, acceptance-criteria status, risks/limitations, and rollback notes.
 """
 
-    return_code, output_tail = run_codex_stream(prompt, log_file, status_context)
+    try:
+        return_code, output_tail = run_codex_stream(prompt, log_file, status_context)
+    except KeyboardInterrupt as exc:
+        paths, snapshot = captured_recovery_scope()
+        if paths:
+            write_status(
+                "RECOVERABLE_CHANGES",
+                log_file=log_file,
+                detail="Controller interrupted; preserved changes require recovery",
+                recoverable_paths=paths,
+                recoverable_snapshot=snapshot,
+                **status_context,
+            )
+            raise RecoverableChangesError(
+                "Controller interrupted; preserved task changes require recovery"
+            ) from exc
+        raise
     if return_code != 0:
+        paths, snapshot = captured_recovery_scope()
+        if paths:
+            write_status(
+                "RECOVERABLE_CHANGES",
+                log_file=log_file,
+                detail=f"Codex exited with {return_code}; preserved changes require recovery",
+                recoverable_paths=paths,
+                recoverable_snapshot=snapshot,
+                **status_context,
+            )
+            raise RecoverableChangesError(
+                f"Codex exited with {return_code}; preserved task changes require recovery"
+            )
         raise RuntimeError(f"Codex exited with {return_code}:\n{output_tail[-3000:]}")
 
     changed = run("git", "status", "--porcelain").stdout.strip()
@@ -1079,79 +2207,7 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
             f"Codex output:\n{output_tail[-3000:]}"
         )
 
-    run_verification(issue, status_context, 1)
-
-    write_status(
-        "COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context
-    )
-    run("git", "add", "-A")
-    run("git", "commit", "-m", f"codex: resolve issue #{number}")
-
-    write_status("PUSHING", log_file=log_file, detail="Pushing task branch", **status_context)
-    run("git", "push", "-u", "origin", branch)
-
-    pr_body = (
-        f"Automated local Codex handoff for #{number}.\n\nCloses #{number}.\n\n"
-        "This PR was created by the self-hosted controller. It is intentionally a draft. "
-        "It must pass independent review and the bounded merge policy before merge. "
-        "No production deployment is authorized."
-    )
-    pr_url = run(
-        "gh",
-        "pr",
-        "create",
-        "--repo",
-        REPO,
-        "--base",
-        "main",
-        "--head",
-        branch,
-        "--draft",
-        "--title",
-        f"{title}",
-        "--body",
-        pr_body,
-    ).stdout.strip()
-
-    write_status(
-        "PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context
-    )
-    comment(number, f"Codex opened a draft PR for independent review: {pr_url}")
-    run_review_fix_loop(issue, status_context)
-    mark_pr_review_passed(pr_url)
-    write_status(
-        "REVIEW_PASSED",
-        detail="Independent review passed with zero findings",
-        pr_url=pr_url,
-        **status_context,
-    )
-    comment(number, f"Independent review passed with zero findings: {pr_url}")
-    label(number, add=REVIEWED_LABEL)
-    reviewed_head = run("git", "rev-parse", "HEAD").stdout.strip()
-    if not reviewed_head:
-        raise RuntimeError("Could not resolve the exact reviewed HEAD commit")
-    outcome = merge_reviewed_pr(issue, branch, pr_url, reviewed_head, status_context)
-    if outcome["merged"]:
-        merge_sha = outcome["sha"]
-        write_status(
-            "MERGED",
-            detail=f"Eligible reviewed PR merged at {merge_sha}",
-            pr_url=pr_url,
-            **status_context,
-        )
-        comment(number, f"Bounded auto-merge completed at `{merge_sha}`: {pr_url}")
-        label(number, add=MERGED_LABEL)
-    else:
-        reason_text = "; ".join(outcome["reasons"])
-        write_status(
-            "MERGE_BLOCKED",
-            detail=reason_text,
-            pr_url=pr_url,
-            **status_context,
-        )
-        comment(number, f"Auto-merge stopped safely; reviewed PR remains open: {reason_text}")
-        label(number, add=MERGE_BLOCKED_LABEL)
-    label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
+    finalize_changes(issue, status_context, log_file, allow_merge=True)
 
 
 def record_issue_failure(issue: Issue, exc: BaseException) -> None:
@@ -1163,12 +2219,129 @@ def record_issue_failure(issue: Issue, exc: BaseException) -> None:
     comment(number, f"Local Codex controller failed:\n\n```text\n{str(exc)[-3000:]}\n```")
 
 
+def recoverable_finalization_error(
+    issue: Issue, exc: BaseException
+) -> RecoverableChangesError | None:
+    """Preserve resumable finalization state instead of overwriting it with FAILED."""
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(status, dict) or status.get("issue") != int(issue["number"]):
+        return None
+    state = status.get("state")
+    checkpoint = status.get("finalization_checkpoint")
+    trusted_paths = status.get("recoverable_paths")
+    has_trusted_manifest = (
+        isinstance(trusted_paths, list)
+        and bool(trusted_paths)
+        and (
+            isinstance(status.get("recoverable_snapshot"), str)
+            or isinstance(status.get("recoverable_content_snapshot"), str)
+        )
+    )
+    recoverable_states = {
+        "VERIFYING",
+        "COMMITTING",
+        "COMMITTED",
+        "PUSHING",
+        "PUSHED",
+        "PR_CREATED",
+        "REVIEWING",
+        "REVIEW_PASSED",
+    }
+    if state not in recoverable_states or (
+        not has_trusted_manifest and checkpoint not in {"COMMITTED", "PUSHED", "PR_CREATED"}
+    ):
+        return None
+    title = status.get("title")
+    branch = status.get("branch")
+    started_at = status.get("started_at")
+    if not all(isinstance(value, str) and value for value in (title, branch, started_at)):
+        return None
+    context: StatusContext = {
+        "issue": int(issue["number"]),
+        "title": cast(str, title),
+        "branch": cast(str, branch),
+        "started_at": cast(str, started_at),
+    }
+    detail = f"Finalization stopped; preserved task work requires recovery: {str(exc)[-700:]}"
+    write_status(
+        "RECOVERABLE_CHANGES",
+        detail=detail,
+        **context,
+    )
+    return RecoverableChangesError(detail)
+
+
+def recoverable_interruption_error(
+    status_context: StatusContext, exc: BaseException
+) -> RecoverableChangesError | None:
+    """Preserve dirty work or a durable checkpoint when the operator interrupts a task."""
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        status = {}
+    checkpoint = status.get("finalization_checkpoint") if isinstance(status, dict) else None
+    trusted_paths = status.get("recoverable_paths") if isinstance(status, dict) else None
+    has_trusted_manifest = (
+        isinstance(trusted_paths, list)
+        and bool(trusted_paths)
+        and (
+            isinstance(status.get("recoverable_snapshot"), str)
+            or isinstance(status.get("recoverable_content_snapshot"), str)
+        )
+    )
+    if not has_trusted_manifest and checkpoint not in {
+        "STAGING",
+        "STAGED",
+        "COMMITTED",
+        "PUSHED",
+        "PR_CREATED",
+    }:
+        return None
+    detail = f"Controller interrupted; preserved task work requires recovery: {str(exc)[-700:]}"
+    write_status(
+        "RECOVERABLE_CHANGES",
+        detail=detail,
+        **status_context,
+    )
+    return RecoverableChangesError(detail)
+
+
+def recorded_status_context(issue: Issue) -> StatusContext | None:
+    """Load the exact persisted context for an actively selected issue."""
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(status, dict) or status.get("issue") != int(issue["number"]):
+        return None
+    title = status.get("title")
+    branch = status.get("branch")
+    started_at = status.get("started_at")
+    if title != issue["title"] or not all(
+        isinstance(value, str) and value for value in (title, branch, started_at)
+    ):
+        return None
+    return {
+        "issue": int(issue["number"]),
+        "title": cast(str, title),
+        "branch": cast(str, branch),
+        "started_at": cast(str, started_at),
+    }
+
+
 def run_once() -> int:
     ensure_tools()
     ensure_labels()
-    clean_tree_required()
     acquire_lock()
     try:
+        recovery = reconcile_stale_run()
+        if recovery is not None:
+            recover_changes(recovery)
+            return 0
+        clean_tree_required()
         issue = next_issue()
         if issue is None:
             write_status("IDLE", detail="No codex-ready issues found")
@@ -1177,7 +2350,12 @@ def run_once() -> int:
         try:
             process_issue(issue)
             return 0
+        except RecoverableChangesError:
+            raise
         except Exception as exc:
+            recovery_error = recoverable_finalization_error(issue, exc)
+            if recovery_error is not None:
+                raise recovery_error from exc
             record_issue_failure(issue, exc)
             raise
     finally:
@@ -1191,6 +2369,20 @@ def run_watch(interval: int) -> int:
     acquire_lock()
     try:
         while True:
+            try:
+                recovery = reconcile_stale_run()
+            except ActiveOrphanError:
+                time.sleep(interval)
+                continue
+            if recovery is not None:
+                try:
+                    recover_changes(recovery)
+                except KeyboardInterrupt as exc:
+                    recovery_error = recoverable_interruption_error(recovery, exc)
+                    if recovery_error is not None:
+                        raise recovery_error from exc
+                    raise
+                continue
             clean_tree_required()
             issue = next_issue()
             if issue is None:
@@ -1201,12 +2393,24 @@ def run_watch(interval: int) -> int:
                 continue
             try:
                 process_issue(issue)
-            except KeyboardInterrupt:
+            except RecoverableChangesError:
+                raise
+            except KeyboardInterrupt as exc:
+                recovery_error = recoverable_finalization_error(issue, exc)
+                if recovery_error is None:
+                    context = recorded_status_context(issue)
+                    if context is not None:
+                        recovery_error = recoverable_interruption_error(context, exc)
+                if recovery_error is not None:
+                    raise recovery_error from exc
                 record_issue_failure(
                     issue, RuntimeError("Controller interrupted during task processing")
                 )
-                raise
+                return 1
             except Exception as exc:
+                recovery_error = recoverable_finalization_error(issue, exc)
+                if recovery_error is not None:
+                    raise recovery_error from exc
                 record_issue_failure(issue, exc)
                 raise
     except KeyboardInterrupt:
@@ -1224,6 +2428,11 @@ def main() -> int:
     )
     modes.add_argument("--watch", action="store_true", help="Continuously watch for ready issues")
     modes.add_argument("--status", action="store_true", help="Show the latest local handoff status")
+    modes.add_argument(
+        "--confirm-recovery",
+        action="store_true",
+        help="Explicitly confirm and finalize a stopped child's uncommitted scope",
+    )
     parser.add_argument(
         "--poll-interval",
         type=poll_interval,
@@ -1237,8 +2446,10 @@ def main() -> int:
 
     if args.status:
         return show_status()
+    if args.confirm_recovery:
+        return confirm_recovery()
     if not args.once and not args.watch:
-        print("Use --once, --watch, or --status.")
+        print("Use --once, --watch, --status, or --confirm-recovery.")
         return 2
     try:
         if args.watch:
