@@ -66,6 +66,10 @@ python3 devtools/codex_handoff.py --watch --poll-interval 30
 controller may run at a time. A second controller rejects a live lock, while a lock left by a
 dead process is recovered automatically.
 
+Active Codex children have a 30-minute no-output limit. Each output event updates the status
+heartbeat. At the limit the controller sends a graceful termination request, waits 10 seconds,
+then kills the child if necessary. This bounds hangs without treating silence as success.
+
 The controller looks for the oldest open issue labeled `codex-ready`.
 
 It will only accept an issue authored by `rajeshkamalwar` by default. Override only intentionally:
@@ -97,6 +101,21 @@ export GROWTH_OS_REPO=rajeshkamalwar/Growth-OS
 12. An eligible PR is marked ready and squash-merged with an exact-head guard. An ineligible or
     ambiguous PR records `MERGE_BLOCKED` and remains open for human handling.
 
+## Interrupted-child recovery
+
+On every `--once` startup and `--watch` cycle, the controller reconciles an `IMPLEMENTING` or
+`RECOVERABLE_CHANGES` status before requiring a clean tree or selecting another issue. If the
+recorded Codex PID is dead and the exact recorded task branch still contains changes, status
+becomes `RECOVERABLE_CHANGES`. The controller then reloads the exact open, owner-authored GitHub
+issue, runs the full verification suite, and continues with commit, push, draft-PR creation, and
+independent review without rerunning implementation.
+
+Recovery fails closed when the PID is still live or branch/task identity cannot be proven. A dead
+child with no changes is a clean `FAILED` run. Verification or finalization failure keeps status
+at `RECOVERABLE_CHANGES`, preserves the task branch and files, releases the controller lock, and
+prevents another issue from starting. Recovery never auto-merges; its reviewed draft PR remains
+open for human handling.
+
 An issue opts into merge evaluation with exactly one assessment block:
 
 ````markdown
@@ -124,6 +143,7 @@ Use `low` or `medium` only. A missing/malformed block or any other value stops m
 - Only issues explicitly labeled `codex-ready` run.
 - Only the configured repository owner's issues are accepted.
 - Dirty working trees are rejected.
+- Uncommitted task work is never discarded automatically.
 - Only one task runs at a time.
 - Codex runs in workspace-write sandbox mode.
 - Review runs in a separate read-only Codex process.

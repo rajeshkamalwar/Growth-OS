@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -68,6 +69,225 @@ def test_stale_or_malformed_controller_lock_is_recovered(
     codex_handoff.acquire_lock()
 
     assert lock_file.read_text(encoding="utf-8") == str(os.getpid())
+
+
+def test_dead_implementing_pid_with_changes_becomes_recoverable(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "codex_pid": 999999,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        outputs: dict[tuple[str, ...], str] = {
+            ("git", "branch", "--show-current"): "codex/issue-110-recover-stalled-child\n",
+            ("git", "status", "--porcelain"): " M docs/DEV-HANDOFF.md\n",
+        }
+        return subprocess.CompletedProcess(args, 0, stdout=outputs.get(args, ""), stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    context = codex_handoff.reconcile_stale_run()
+
+    assert context == {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "RECOVERABLE_CHANGES"
+
+
+def test_dead_implementing_pid_without_changes_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "IMPLEMENTING",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+                "codex_pid": 999999,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_handoff, "pid_is_running", lambda _pid: False)
+
+    def fake_run(*args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = (
+            "codex/issue-110-recover-stalled-child\n"
+            if args == ("git", "branch", "--show-current")
+            else ""
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(codex_handoff, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="no working-tree changes"):
+        codex_handoff.reconcile_stale_run()
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "FAILED"
+
+
+def test_recovery_fails_closed_when_branch_identity_does_not_match(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    _lock_file, status_file = runtime_paths
+    status_file.write_text(
+        json.dumps(
+            {
+                "state": "RECOVERABLE_CHANGES",
+                "issue": 110,
+                "title": "Recover stalled child",
+                "branch": "codex/issue-110-recover-stalled-child",
+                "started_at": "2026-08-22T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="codex/different-task\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="branch identity"):
+        codex_handoff.reconcile_stale_run()
+
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "RECOVERABLE_CHANGES"
+
+
+def test_no_output_child_is_terminated_after_bounded_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    command = (
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+    )
+
+    return_code, output = codex_handoff.run_codex_stream(
+        "",
+        tmp_path / "hung.log",
+        {"issue": 110, "title": "Task", "branch": "codex/task", "started_at": "now"},
+        command=command,
+        inactivity_timeout=0.05,
+        termination_grace=0.1,
+    )
+
+    assert return_code != 0
+    assert "inactivity timeout" in output
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "IMPLEMENTING"
+    assert status["codex_pid"] is None
+
+
+def test_recovery_verifies_and_finalizes_without_rerunning_implementation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    issue = {"number": 110, "title": "Recover stalled child", "body": "Contract"}
+    events: list[str] = []
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(
+        codex_handoff,
+        "load_recovery_issue",
+        lambda received: issue if received == context else None,
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "finalize_changes",
+        lambda received_issue, received_context, _log, *, allow_merge: events.append(
+            f"finalize:{received_issue['number']}:{received_context['branch']}:{allow_merge}"
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: events.append("comment"))
+
+    codex_handoff.recover_changes(context)
+
+    assert events == ["comment", "finalize:110:codex/issue-110-recover-stalled-child:False"]
+
+
+def test_failed_child_with_changes_is_recoverable_not_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "STATUS_FILE", tmp_path / "status.json")
+    monkeypatch.setattr(codex_handoff, "prepare_task_branch", lambda _branch: None)
+    monkeypatch.setattr(
+        codex_handoff, "run_codex_stream", lambda *_args, **_kwargs: (9, "timed out")
+    )
+    monkeypatch.setattr(
+        codex_handoff,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=" M docs/DEV-HANDOFF.md\n" if args == ("git", "status", "--porcelain") else "",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(codex_handoff, "label", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(codex_handoff, "comment", lambda *_args: None)
+
+    with pytest.raises(codex_handoff.RecoverableChangesError):
+        codex_handoff.process_issue({"number": 110, "title": "Recover stalled child"})
+
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "RECOVERABLE_CHANGES"
+    assert "preserved changes" in status["detail"]
+
+
+def test_failed_recovery_releases_controller_lock(
+    monkeypatch: pytest.MonkeyPatch, runtime_paths: tuple[Path, Path]
+) -> None:
+    lock_file, _status_file = runtime_paths
+    context = {
+        "issue": 110,
+        "title": "Recover stalled child",
+        "branch": "codex/issue-110-recover-stalled-child",
+        "started_at": "2026-08-22T00:00:00+00:00",
+    }
+    monkeypatch.setattr(codex_handoff, "ensure_tools", lambda: None)
+    monkeypatch.setattr(codex_handoff, "ensure_labels", lambda: None)
+    monkeypatch.setattr(codex_handoff, "reconcile_stale_run", lambda: context)
+    monkeypatch.setattr(
+        codex_handoff,
+        "recover_changes",
+        lambda _context: (_ for _ in ()).throw(
+            codex_handoff.RecoverableChangesError("verification failed")
+        ),
+    )
+
+    with pytest.raises(codex_handoff.RecoverableChangesError, match="verification failed"):
+        codex_handoff.run_once()
+
+    assert not lock_file.exists()
 
 
 def test_watch_polls_while_idle_and_stops_cleanly(
@@ -896,6 +1116,7 @@ def test_run_reviewer_stops_on_command_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(codex_handoff, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(codex_handoff, "REVIEW_SCHEMA_RUNTIME", tmp_path / "review.schema.json")
     commands: list[tuple[str, ...]] = []
     environments: list[dict[str, str]] = []
 

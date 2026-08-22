@@ -20,6 +20,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,8 @@ MAX_POLL_INTERVAL = 3600
 MAX_FIX_ROUNDS = 2
 MAX_REVIEW_RESULT_BYTES = 65_536
 MAX_REVIEW_FINDINGS = 20
+DEFAULT_CHILD_INACTIVITY_TIMEOUT = 1800
+CHILD_TERMINATION_GRACE = 10.0
 AUTO_MERGE_FIELDS = {
     "risk",
     "roadmap_authorized",
@@ -193,6 +196,10 @@ class MergeOutcome(TypedDict):
     merged: bool
     reasons: list[str]
     sha: str | None
+
+
+class RecoverableChangesError(RuntimeError):
+    """Recovery stopped while preserved task work remains unresolved."""
 
 
 def now_iso() -> str:
@@ -351,6 +358,7 @@ def write_status(
     started_at: str | None = None,
     detail: str | None = None,
     codex_pid: int | None = None,
+    last_child_output_at: str | None = None,
     pr_url: str | None = None,
 ) -> None:
     previous: dict[str, object] = {}
@@ -368,6 +376,11 @@ def write_status(
         "updated_at": now_iso(),
         "controller_pid": os.getpid(),
         "codex_pid": codex_pid,
+        "last_child_output_at": (
+            last_child_output_at
+            if last_child_output_at is not None
+            else previous.get("last_child_output_at")
+        ),
         "log_file": str(log_file) if log_file else previous.get("log_file"),
         "detail": detail,
         "pr_url": pr_url if pr_url is not None else previous.get("pr_url"),
@@ -391,6 +404,8 @@ def show_status() -> int:
         print(f"Last update: {data['updated_at']}")
     if data.get("codex_pid"):
         print(f"Codex PID: {data['codex_pid']}")
+    if data.get("last_child_output_at"):
+        print(f"Last child output: {data['last_child_output_at']}")
     if data.get("pr_url"):
         print(f"PR: {data['pr_url']}")
     if data.get("detail"):
@@ -477,6 +492,8 @@ def run_codex_stream(
     command: tuple[str, ...] = ("codex", "exec", "--sandbox", "workspace-write"),
     state: str = "IMPLEMENTING",
     env: dict[str, str] | None = None,
+    inactivity_timeout: float = DEFAULT_CHILD_INACTIVITY_TIMEOUT,
+    termination_grace: float = CHILD_TERMINATION_GRACE,
 ) -> tuple[int, str]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     tail: list[str] = []
@@ -490,19 +507,118 @@ def run_codex_stream(
             bufsize=1,
             env=env,
         )
-        write_status(state, codex_pid=process.pid, log_file=log_file, **status_context)
+        heartbeat = now_iso()
+        write_status(
+            state,
+            codex_pid=process.pid,
+            log_file=log_file,
+            last_child_output_at=heartbeat,
+            **status_context,
+        )
         assert process.stdin is not None
         process.stdin.write(prompt)
         process.stdin.close()
         assert process.stdout is not None
-        for line in process.stdout:
-            log.write(line)
+        deadline = time.monotonic() + inactivity_timeout
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                message = f"Codex child exceeded {inactivity_timeout:g}s inactivity timeout\n"
+                log.write(message)
+                log.flush()
+                tail.append(message)
+                process.terminate()
+                try:
+                    process.wait(timeout=termination_grace)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                write_status(
+                    state,
+                    codex_pid=None,
+                    log_file=log_file,
+                    detail=message.strip(),
+                    **status_context,
+                )
+                return process.returncode, "".join(tail)
+            readable, _, _ = select.select([process.stdout], [], [], min(1.0, remaining))
+            if not readable:
+                continue
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                continue
+            output = chunk.decode(errors="replace")
+            log.write(output)
             log.flush()
-            tail.append(line)
+            tail.append(output)
             if len(tail) > 100:
                 tail.pop(0)
+            heartbeat = now_iso()
+            deadline = time.monotonic() + inactivity_timeout
+            write_status(
+                state,
+                codex_pid=process.pid,
+                log_file=log_file,
+                last_child_output_at=heartbeat,
+                **status_context,
+            )
         return_code = process.wait()
+        write_status(state, codex_pid=None, log_file=log_file, **status_context)
     return return_code, "".join(tail)
+
+
+def reconcile_stale_run() -> StatusContext | None:
+    """Fail closed or surface preserved work from an interrupted implementation."""
+    if not STATUS_FILE.exists():
+        return None
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("Handoff status is unreadable; refusing startup recovery") from exc
+    if not isinstance(status, dict) or status.get("state") not in {
+        "IMPLEMENTING",
+        "RECOVERABLE_CHANGES",
+    }:
+        return None
+
+    issue = status.get("issue")
+    title = status.get("title")
+    branch = status.get("branch")
+    started_at = status.get("started_at")
+    if type(issue) is not int or not all(
+        isinstance(value, str) and value for value in (title, branch, started_at)
+    ):
+        raise RuntimeError("Stale implementation status cannot prove task ownership")
+    context: StatusContext = {
+        "issue": issue,
+        "title": cast(str, title),
+        "branch": cast(str, branch),
+        "started_at": cast(str, started_at),
+    }
+    pid = status.get("codex_pid")
+    if status["state"] == "IMPLEMENTING" and type(pid) is int and pid_is_running(pid):
+        raise RuntimeError(f"Recorded Codex PID {pid} is still running; refusing recovery")
+
+    current_branch = run("git", "branch", "--show-current").stdout.strip()
+    if current_branch != branch:
+        raise RuntimeError(
+            "Cannot prove recovery branch identity: "
+            f"status records {branch!r}, checkout is {current_branch!r}"
+        )
+    if not run("git", "status", "--porcelain").stdout.strip():
+        write_status(
+            "FAILED",
+            detail="Interrupted Codex implementation left no working-tree changes",
+            **context,
+        )
+        raise RuntimeError("Interrupted Codex implementation left no working-tree changes")
+
+    write_status(
+        "RECOVERABLE_CHANGES",
+        detail="Preserved changes from an interrupted Codex implementation; recovery required",
+        **context,
+    )
+    return context
 
 
 def _review_result_error(detail: str) -> RuntimeError:
@@ -1012,6 +1128,139 @@ def run_review_fix_loop(issue: Issue, status_context: StatusContext) -> ReviewRe
     raise AssertionError("unreachable review loop state")
 
 
+def finalize_changes(
+    issue: Issue,
+    status_context: StatusContext,
+    log_file: Path,
+    *,
+    allow_merge: bool,
+) -> None:
+    """Verify preserved changes and complete the normal commit/push/draft-PR workflow."""
+    number = int(issue["number"])
+    title = issue["title"]
+    branch = status_context["branch"]
+    run_verification(issue, status_context, 1)
+
+    write_status(
+        "COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context
+    )
+    run("git", "add", "-A")
+    run("git", "commit", "-m", f"codex: resolve issue #{number}")
+
+    write_status("PUSHING", log_file=log_file, detail="Pushing task branch", **status_context)
+    run("git", "push", "-u", "origin", branch)
+
+    pr_body = (
+        f"Automated local Codex handoff for #{number}.\n\nCloses #{number}.\n\n"
+        "This PR was created by the self-hosted controller. It is intentionally a draft. "
+        "It must pass independent review and the bounded merge policy before merge. "
+        "No production deployment is authorized."
+    )
+    pr_url = run(
+        "gh",
+        "pr",
+        "create",
+        "--repo",
+        REPO,
+        "--base",
+        "main",
+        "--head",
+        branch,
+        "--draft",
+        "--title",
+        title,
+        "--body",
+        pr_body,
+    ).stdout.strip()
+
+    write_status(
+        "PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context
+    )
+    comment(number, f"Codex opened a draft PR for independent review: {pr_url}")
+    run_review_fix_loop(issue, status_context)
+    mark_pr_review_passed(pr_url)
+    write_status(
+        "REVIEW_PASSED",
+        detail="Independent review passed with zero findings",
+        pr_url=pr_url,
+        **status_context,
+    )
+    comment(number, f"Independent review passed with zero findings: {pr_url}")
+    label(number, add=REVIEWED_LABEL)
+    reviewed_head = run("git", "rev-parse", "HEAD").stdout.strip()
+    if not reviewed_head:
+        raise RuntimeError("Could not resolve the exact reviewed HEAD commit")
+    outcome: MergeOutcome
+    if allow_merge:
+        outcome = merge_reviewed_pr(issue, branch, pr_url, reviewed_head, status_context)
+    else:
+        outcome = {
+            "merged": False,
+            "reasons": ["Recovery never auto-merges preserved work"],
+            "sha": None,
+        }
+    if outcome["merged"]:
+        merge_sha = outcome["sha"]
+        write_status(
+            "MERGED",
+            detail=f"Eligible reviewed PR merged at {merge_sha}",
+            pr_url=pr_url,
+            **status_context,
+        )
+        comment(number, f"Bounded auto-merge completed at `{merge_sha}`: {pr_url}")
+        label(number, add=MERGED_LABEL)
+    else:
+        reason_text = "; ".join(outcome["reasons"])
+        write_status("MERGE_BLOCKED", detail=reason_text, pr_url=pr_url, **status_context)
+        comment(number, f"Auto-merge stopped safely; reviewed PR remains open: {reason_text}")
+        label(number, add=MERGE_BLOCKED_LABEL)
+    label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
+
+
+def load_recovery_issue(status_context: StatusContext) -> Issue:
+    """Reload the exact owner-authored open issue recorded by the interrupted run."""
+    number = status_context["issue"]
+    payload = gh_json(
+        "issue",
+        "view",
+        str(number),
+        "--repo",
+        REPO,
+        "--json",
+        "number,title,body,author,state,url",
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("Cannot prove recovery task ownership from GitHub")
+    author = payload.get("author")
+    if (
+        type(payload.get("number")) is not int
+        or payload["number"] != number
+        or payload.get("title") != status_context["title"]
+        or payload.get("state") != "OPEN"
+        or not isinstance(author, dict)
+        or str(author.get("login", "")).lower() != OWNER.lower()
+    ):
+        raise RuntimeError("Cannot prove recovery task ownership from GitHub")
+    return cast(Issue, payload)
+
+
+def recover_changes(status_context: StatusContext) -> None:
+    """Finalize preserved implementation work without invoking Codex implementation again."""
+    issue = load_recovery_issue(status_context)
+    number = status_context["issue"]
+    log_file = LOG_DIR / f"recovery-{number}.log"
+    comment(number, "Recovering preserved task changes without rerunning implementation.")
+    try:
+        finalize_changes(issue, status_context, log_file, allow_merge=False)
+    except Exception as exc:
+        write_status(
+            "RECOVERABLE_CHANGES",
+            detail=f"Recovery stopped; preserved changes remain: {str(exc)[-700:]}",
+            **status_context,
+        )
+        raise RecoverableChangesError(str(exc)) from exc
+
+
 def process_issue(issue: Issue) -> None:
     number = int(issue["number"])
     title = issue["title"]
@@ -1066,6 +1315,16 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
 
     return_code, output_tail = run_codex_stream(prompt, log_file, status_context)
     if return_code != 0:
+        if run("git", "status", "--porcelain").stdout.strip():
+            write_status(
+                "RECOVERABLE_CHANGES",
+                log_file=log_file,
+                detail=f"Codex exited with {return_code}; preserved changes require recovery",
+                **status_context,
+            )
+            raise RecoverableChangesError(
+                f"Codex exited with {return_code}; preserved task changes require recovery"
+            )
         raise RuntimeError(f"Codex exited with {return_code}:\n{output_tail[-3000:]}")
 
     changed = run("git", "status", "--porcelain").stdout.strip()
@@ -1079,79 +1338,7 @@ checks run and results, acceptance-criteria status, risks/limitations, and rollb
             f"Codex output:\n{output_tail[-3000:]}"
         )
 
-    run_verification(issue, status_context, 1)
-
-    write_status(
-        "COMMITTING", log_file=log_file, detail="Committing Codex changes", **status_context
-    )
-    run("git", "add", "-A")
-    run("git", "commit", "-m", f"codex: resolve issue #{number}")
-
-    write_status("PUSHING", log_file=log_file, detail="Pushing task branch", **status_context)
-    run("git", "push", "-u", "origin", branch)
-
-    pr_body = (
-        f"Automated local Codex handoff for #{number}.\n\nCloses #{number}.\n\n"
-        "This PR was created by the self-hosted controller. It is intentionally a draft. "
-        "It must pass independent review and the bounded merge policy before merge. "
-        "No production deployment is authorized."
-    )
-    pr_url = run(
-        "gh",
-        "pr",
-        "create",
-        "--repo",
-        REPO,
-        "--base",
-        "main",
-        "--head",
-        branch,
-        "--draft",
-        "--title",
-        f"{title}",
-        "--body",
-        pr_body,
-    ).stdout.strip()
-
-    write_status(
-        "PR_CREATED", log_file=log_file, detail="Draft PR opened", pr_url=pr_url, **status_context
-    )
-    comment(number, f"Codex opened a draft PR for independent review: {pr_url}")
-    run_review_fix_loop(issue, status_context)
-    mark_pr_review_passed(pr_url)
-    write_status(
-        "REVIEW_PASSED",
-        detail="Independent review passed with zero findings",
-        pr_url=pr_url,
-        **status_context,
-    )
-    comment(number, f"Independent review passed with zero findings: {pr_url}")
-    label(number, add=REVIEWED_LABEL)
-    reviewed_head = run("git", "rev-parse", "HEAD").stdout.strip()
-    if not reviewed_head:
-        raise RuntimeError("Could not resolve the exact reviewed HEAD commit")
-    outcome = merge_reviewed_pr(issue, branch, pr_url, reviewed_head, status_context)
-    if outcome["merged"]:
-        merge_sha = outcome["sha"]
-        write_status(
-            "MERGED",
-            detail=f"Eligible reviewed PR merged at {merge_sha}",
-            pr_url=pr_url,
-            **status_context,
-        )
-        comment(number, f"Bounded auto-merge completed at `{merge_sha}`: {pr_url}")
-        label(number, add=MERGED_LABEL)
-    else:
-        reason_text = "; ".join(outcome["reasons"])
-        write_status(
-            "MERGE_BLOCKED",
-            detail=reason_text,
-            pr_url=pr_url,
-            **status_context,
-        )
-        comment(number, f"Auto-merge stopped safely; reviewed PR remains open: {reason_text}")
-        label(number, add=MERGE_BLOCKED_LABEL)
-    label(number, add=DONE_LABEL, remove=RUNNING_LABEL)
+    finalize_changes(issue, status_context, log_file, allow_merge=True)
 
 
 def record_issue_failure(issue: Issue, exc: BaseException) -> None:
@@ -1166,9 +1353,13 @@ def record_issue_failure(issue: Issue, exc: BaseException) -> None:
 def run_once() -> int:
     ensure_tools()
     ensure_labels()
-    clean_tree_required()
     acquire_lock()
     try:
+        recovery = reconcile_stale_run()
+        if recovery is not None:
+            recover_changes(recovery)
+            return 0
+        clean_tree_required()
         issue = next_issue()
         if issue is None:
             write_status("IDLE", detail="No codex-ready issues found")
@@ -1177,6 +1368,8 @@ def run_once() -> int:
         try:
             process_issue(issue)
             return 0
+        except RecoverableChangesError:
+            raise
         except Exception as exc:
             record_issue_failure(issue, exc)
             raise
@@ -1191,6 +1384,10 @@ def run_watch(interval: int) -> int:
     acquire_lock()
     try:
         while True:
+            recovery = reconcile_stale_run()
+            if recovery is not None:
+                recover_changes(recovery)
+                continue
             clean_tree_required()
             issue = next_issue()
             if issue is None:
@@ -1201,6 +1398,8 @@ def run_watch(interval: int) -> int:
                 continue
             try:
                 process_issue(issue)
+            except RecoverableChangesError:
+                raise
             except KeyboardInterrupt:
                 record_issue_failure(
                     issue, RuntimeError("Controller interrupted during task processing")
